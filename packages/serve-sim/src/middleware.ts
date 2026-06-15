@@ -1,6 +1,5 @@
-import { readdirSync, readFileSync, existsSync, unlinkSync, watch, type FSWatcher } from "fs";
+import { existsSync, watch, type FSWatcher } from "fs";
 import { execSync, spawn, exec, execFile, type ChildProcess, type ExecException } from "child_process";
-import { tmpdir } from "os";
 import { join } from "path";
 import { createServer as createNetServer } from "net";
 import { randomBytes, timingSafeEqual } from "crypto";
@@ -9,6 +8,22 @@ import { createAxStreamerCache } from "./ax";
 import { debugMw } from "./debug";
 import { createExecUpgradeHandler, type UiRequestHandler } from "./exec-ws";
 import { UI_OPTIONS, getUiStatus, normalizeUiValue, setUiOption } from "./ui-settings";
+import {
+  handleNetworkRoute,
+  PayloadTooLargeError,
+  type NetworkRouteResult,
+} from "./network/routes";
+import {
+  STATE_DIR,
+  type ServeSimState,
+  invalidateBootedSnapshot,
+  readServeSimStates,
+  selectServeSimState,
+} from "./state";
+
+// Re-exported for consumers (and tests) that import these from the middleware.
+export { selectServeSimState };
+export type { ServeSimState };
 
 type SimReq = IncomingMessage;
 type SimRes = ServerResponse;
@@ -16,7 +31,10 @@ type SimNext = (err?: unknown) => void;
 
 // Injected at build time as a base64-encoded string via `define`
 declare const __PREVIEW_HTML_B64__: string;
-const STATE_DIR = join(tmpdir(), "serve-sim");
+declare const __SERVE_SIM_VERSION__: string;
+// Build-time version for HAR creator metadata; "0.0.0" when run unbundled (tests).
+const SERVE_SIM_VERSION =
+  typeof __SERVE_SIM_VERSION__ !== "undefined" ? __SERVE_SIM_VERSION__ : "0.0.0";
 // Last logged result of a GET /api selection, used to suppress the
 // once-every-poll duplicate debugMw lines (the UI polls /api every ~2s).
 let lastApiLogKey: string | undefined;
@@ -64,10 +82,6 @@ type CdpHttpListEntry = {
 
 type CdpHttpVersion = { Browser?: string };
 
-type SimctlBootedList = {
-  devices: Record<string, Array<{ udid: string; state: string }>>;
-};
-
 type SimctlAllList = {
   devices: Record<string, Array<Omit<SimctlDevice, "runtime">>>;
 };
@@ -77,15 +91,6 @@ type StartRequestBody = { udid?: string };
 type ReleaseRequestBody = { targetId?: string };
 type HighlightRequestBody = { targetId?: string; on?: boolean };
 type ExecRequestBody = { command?: string };
-
-export interface ServeSimState {
-  pid: number;
-  port: number;
-  device: string;
-  url: string;
-  streamUrl: string;
-  wsUrl: string;
-}
 
 const axStreamerCache = createAxStreamerCache();
 
@@ -173,87 +178,6 @@ export function matchInstalledAppByDisplayName(
     }
   }
   return null;
-}
-
-// Cache simctl's booted-device set briefly so per-request cost stays bounded.
-// The middleware runs inside the user's dev server (Metro etc.) and
-// readServeSimStates() is called on every /api and every page load.
-let bootedSnapshot: { at: number; booted: Set<string> | null } = { at: 0, booted: null };
-function getBootedUdids(): Set<string> | null {
-  const now = Date.now();
-  if (bootedSnapshot.booted && now - bootedSnapshot.at < 1500) {
-    return bootedSnapshot.booted;
-  }
-  try {
-    const output = execSync("xcrun simctl list devices booted -j", {
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 3_000,
-    });
-    const data = JSON.parse(output) as SimctlBootedList;
-    const booted = new Set<string>();
-    for (const runtime of Object.values(data.devices)) {
-      for (const device of runtime) {
-        if (device.state === "Booted") booted.add(device.udid);
-      }
-    }
-    bootedSnapshot = { at: now, booted };
-    return booted;
-  } catch {
-    return null;
-  }
-}
-
-function readServeSimStates(): ServeSimState[] {
-  let files: string[];
-  try {
-    files = readdirSync(STATE_DIR).filter(
-      (f) => f.startsWith("server-") && f.endsWith(".json"),
-    );
-  } catch {
-    return [];
-  }
-  const booted = getBootedUdids();
-  const states: ServeSimState[] = [];
-  for (const f of files) {
-    const path = join(STATE_DIR, f);
-    try {
-      const state: ServeSimState = JSON.parse(readFileSync(path, "utf-8"));
-      try {
-        process.kill(state.pid, 0);
-      } catch {
-        debugMw("helper pid=%d gone, removing %s", state.pid, path);
-        try { unlinkSync(path); } catch {}
-        continue;
-      }
-      // Helper alive but its simulator was shut down — the MJPEG stream
-      // would accept connections yet never produce frames, leaving the
-      // preview stuck on "Connecting...". Recycle the stale state so the
-      // caller can spawn a fresh helper bound to whatever is booted.
-      if (booted && !booted.has(state.device)) {
-        debugMw(
-          "recycling stale helper pid=%d (device %s no longer booted)",
-          state.pid,
-          state.device,
-        );
-        try { process.kill(state.pid, "SIGTERM"); } catch {}
-        try { unlinkSync(path); } catch {}
-        continue;
-      }
-      states.push(state);
-    } catch {}
-  }
-  return states;
-}
-
-export function selectServeSimState(
-  states: ServeSimState[],
-  device?: string | null,
-): ServeSimState | null {
-  if (device) {
-    return states.find((state) => state.device === device) ?? null;
-  }
-  return states[0] ?? null;
 }
 
 function queryDevice(rawUrl: string): string | null {
@@ -522,6 +446,58 @@ function listAllSimulators(): SimctlDevice[] {
   }
 }
 
+/**
+ * Build the `/grid/api` payload: every supported simulator annotated with its
+ * running helper (URLs rewritten to the request host), sorted family → state →
+ * name so the most-used devices stay near the top. Shared by both servers.
+ */
+function buildGridDevices(host?: string): {
+  devices: Array<{
+    device: string;
+    name: string;
+    runtime: string;
+    state: string;
+    helper: { port: number; url: string; streamUrl: string; wsUrl: string } | null;
+  }>;
+} {
+  const helperByUdid = new Map(readServeSimStates().map((s) => [s.device, s] as const));
+  const devices = listAllSimulators().map((d) => {
+    const helper = helperByUdid.get(d.udid);
+    const remoteHelper = helper ? rewriteStateForRequestHost(helper, host) : null;
+    return {
+      device: d.udid,
+      name: d.name,
+      runtime: d.runtime,
+      state: d.state,
+      helper: remoteHelper
+        ? {
+            port: remoteHelper.port,
+            url: remoteHelper.url,
+            streamUrl: remoteHelper.streamUrl,
+            wsUrl: remoteHelper.wsUrl,
+          }
+        : null,
+    };
+  });
+  // Stable order: family (iPhone, iPad, Watch, TV, Vision, other) → state
+  // (helper > booted > shutdown) → alpha.
+  const familyRank = (name: string): number => {
+    if (/iphone/i.test(name)) return 0;
+    if (/ipad/i.test(name)) return 1;
+    if (/watch/i.test(name)) return 2;
+    if (/(apple\s*tv|^tv\b)/i.test(name)) return 3;
+    if (/vision|reality/i.test(name)) return 4;
+    return 5;
+  };
+  const stateRank = (x: typeof devices[number]) => (x.helper ? 0 : x.state === "Booted" ? 1 : 2);
+  devices.sort((a, b) =>
+    familyRank(a.name) - familyRank(b.name) ||
+    stateRank(a) - stateRank(b) ||
+    a.name.localeCompare(b.name),
+  );
+  return { devices };
+}
+
 // Default per-simulator footprint when we have no running sim to measure
 // from — a fresh booted iOS sim with one app launched typically sits in
 // the 1.2–1.8 GB range. Used as a fallback only.
@@ -676,6 +652,12 @@ export interface SimMiddlewareOptions {
    * cross-origin pages cannot read it.
    */
   execToken?: string;
+  /**
+   * Override the serve-sim binary path advertised to the client (used to build
+   * the sidebar's `serve-sim …` CLI prefix). Defaults to the running binary.
+   * The dev server passes its local entry so in-page CLI calls run from source.
+   */
+  serveSimBin?: string;
 }
 
 function safeEqualString(a: string, b: string): boolean {
@@ -690,6 +672,41 @@ function isJsonContentType(value: string | undefined): boolean {
   // `application/json; charset=utf-8` etc. — only the media type matters.
   const mediaType = value.split(";", 1)[0]!.trim().toLowerCase();
   return mediaType === "application/json";
+}
+
+/** Render a shared `NetworkRouteResult` onto a Node response. */
+function renderNetworkResultNode(req: SimReq, res: SimRes, result: NetworkRouteResult): void {
+  switch (result.kind) {
+    case "json":
+      res.writeHead(result.status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify(result.body));
+      return;
+    case "text":
+      res.writeHead(result.status, {
+        "Content-Type": result.contentType ?? "text/plain",
+        "Cache-Control": "no-store",
+        ...result.headers,
+      });
+      res.end(result.body);
+      return;
+    case "bytes":
+      res.writeHead(result.status, { "Content-Type": result.contentType, "Cache-Control": "no-store" });
+      res.end(result.body);
+      return;
+    case "sse": {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+      const teardown = result.subscribe((chunk) => {
+        if (!res.writableEnded) res.write(chunk);
+      });
+      req.on("close", teardown);
+      return;
+    }
+  }
 }
 
 /**
@@ -707,6 +724,7 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
   // can call /exec; cross-origin pages and LAN clients cannot, because they
   // can't read this value (it's only injected into the preview page's config).
   const execToken = options?.execToken ?? randomBytes(32).toString("base64url");
+  const serveSimBin = options?.serveSimBin ?? serveSimBinPath();
 
   // Simulator-settings requests run in-process (just the underlying simctl /
   // ax-tool spawn) instead of round-tripping a full `node <cli>` exec per
@@ -786,7 +804,7 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
 
       if (state) {
         const remoteState = rewriteStateForRequestHost(state, req.headers?.host);
-        const config = JSON.stringify(previewConfigForState(remoteState, base, serveSimBinPath(), execToken));
+        const config = JSON.stringify(previewConfigForState(remoteState, base, serveSimBin, execToken));
         const configScript = `<script>window.__SIM_PREVIEW__=${config}</script>`;
         html = html.replace("<!--__SIM_PREVIEW_CONFIG__-->", configScript);
       }
@@ -811,50 +829,11 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
 
     // Grid JSON: every supported simulator, annotated with running helper info if any.
     if (url === base + "/grid/api") {
-      const states = readServeSimStates();
-      const helperByUdid = new Map(states.map((s) => [s.device, s] as const));
-      const sims = listAllSimulators();
-      const devices = sims.map((d) => {
-        const helper = helperByUdid.get(d.udid);
-        const remoteHelper = helper ? rewriteStateForRequestHost(helper, req.headers?.host) : null;
-        return {
-          device: d.udid,
-          name: d.name,
-          runtime: d.runtime,
-          state: d.state,
-          helper: remoteHelper
-            ? {
-                port: remoteHelper.port,
-                url: remoteHelper.url,
-                streamUrl: remoteHelper.streamUrl,
-                wsUrl: remoteHelper.wsUrl,
-              }
-            : null,
-        };
-      });
-      // Stable order: family (iPhone, iPad, Watch, TV, Vision, other) →
-      // state (helper > booted > shutdown) → alpha. Keeps the most
-      // commonly used devices visible without scrolling.
-      const familyRank = (name: string): number => {
-        if (/iphone/i.test(name)) return 0;
-        if (/ipad/i.test(name)) return 1;
-        if (/watch/i.test(name)) return 2;
-        if (/(apple\s*tv|^tv\b)/i.test(name)) return 3;
-        if (/vision|reality/i.test(name)) return 4;
-        return 5;
-      };
-      const stateRank = (x: typeof devices[number]) =>
-        x.helper ? 0 : x.state === "Booted" ? 1 : 2;
-      devices.sort((a, b) =>
-        familyRank(a.name) - familyRank(b.name) ||
-        stateRank(a) - stateRank(b) ||
-        a.name.localeCompare(b.name),
-      );
       res.writeHead(200, {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
       });
-      res.end(JSON.stringify({ devices }));
+      res.end(JSON.stringify(buildGridDevices(req.headers?.host)));
       return;
     }
 
@@ -876,7 +855,7 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
         }
         // Drop the snapshot so the next /grid/api call re-queries simctl
         // and prunes any helper bound to this now-shutdown device.
-        bootedSnapshot = { at: 0, booted: null };
+        invalidateBootedSnapshot();
         execFile("xcrun", ["simctl", "shutdown", udid], { timeout: 30_000 }, (err, _stdout, stderr) => {
           if (err) {
             res.writeHead(500, { "Content-Type": "application/json" });
@@ -1075,7 +1054,49 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
         "Cache-Control": "no-store",
       });
       const remoteState = state ? rewriteStateForRequestHost(state, req.headers?.host) : null;
-      res.end(JSON.stringify(remoteState ? previewConfigForState(remoteState, base, serveSimBinPath(), execToken) : null));
+      res.end(JSON.stringify(remoteState ? previewConfigForState(remoteState, base, serveSimBin, execToken) : null));
+      return;
+    }
+
+    // ── Network inspector ────────────────────────────────────────────────
+    // Capture/inspect simulator HTTP(S) traffic (Proxyman-style: MITM proxy +
+    // macOS system-proxy redirect + per-sim CA trust). Mutating routes are
+    // gated by the same bearer token as /exec since they change system state;
+    // read-only routes (status/requests/events/har) are same-origin like /ax.
+    if (url === base + "/api/network" || url.startsWith(base + "/api/network/")) {
+      const sub = url.slice((base + "/api/network").length).replace(/^\//, "");
+      const params = qIndex === -1 ? new URLSearchParams() : new URLSearchParams(rawUrl.slice(qIndex + 1));
+      handleNetworkRoute(
+        {
+          method: req.method ?? "GET",
+          sub,
+          params,
+          host: req.headers.host,
+          origin: req.headers.origin,
+          contentType: req.headers["content-type"],
+          authorization: req.headers.authorization,
+          selectedDevice,
+          // Stream the body with a 1 MB cap (it's only read for mutating routes,
+          // after the router has authed). Malformed JSON → {}; oversized → 413.
+          readJson: () =>
+            new Promise((resolveBody, rejectBody) => {
+              let buf = "";
+              req.on("data", (chunk: Buffer | string) => {
+                buf += typeof chunk === "string" ? chunk : chunk.toString();
+                if (buf.length > 1024 * 1024) {
+                  rejectBody(new PayloadTooLargeError());
+                  req.destroy();
+                }
+              });
+              req.on("end", () => {
+                try { resolveBody(buf ? JSON.parse(buf) : {}); }
+                catch { resolveBody({}); }
+              });
+              req.on("error", rejectBody);
+            }),
+        },
+        { execToken, version: SERVE_SIM_VERSION },
+      ).then((result) => renderNetworkResultNode(req, res, result));
       return;
     }
 
@@ -1089,7 +1110,7 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
         const state = selectServeSimState(states, selectedDevice);
         const remoteState = state ? rewriteStateForRequestHost(state, req.headers?.host) : null;
         return JSON.stringify(
-          remoteState ? previewConfigForState(remoteState, base, serveSimBinPath(), execToken) : null,
+          remoteState ? previewConfigForState(remoteState, base, serveSimBin, execToken) : null,
         );
       };
 
@@ -1426,6 +1447,7 @@ export function simMiddleware(options?: SimMiddlewareOptions) {
         `${base}/appstate`,
         `${base}/logs`,
         `${base}/ax`,
+        `${base}/api/network/events`,
       ],
       onUiRequest: handleUiRequest,
     }),

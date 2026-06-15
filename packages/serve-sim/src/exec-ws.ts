@@ -55,7 +55,7 @@ interface ExecMessage {
 /** In-process handler for `{id, ui}` requests; resolves to the reply body. */
 export type UiRequestHandler = (payload: unknown) => Promise<Record<string, unknown>>;
 
-interface ExecChannelOptions {
+export interface ExecChannelOptions {
   path: string;
   execToken: string;
   /** Exact pathnames (query excluded) the channel may proxy as SSE. */
@@ -64,21 +64,30 @@ interface ExecChannelOptions {
   onUiRequest?: UiRequestHandler;
 }
 
-function wireExecSocket(
-  ws: WebSocket,
+/** Transport-agnostic handlers for one exec channel connection. */
+export interface ExecChannelHandlers {
+  onMessage(data: string): void;
+  onClose(): void;
+}
+
+/**
+ * Core exec-channel protocol, decoupled from any particular WebSocket
+ * implementation. `send` serializes one reply frame; `close` tears down the
+ * underlying socket. Used by `wireExecSocket` (the `ws`-based middleware
+ * server) and by the Bun-native dev server, so both speak the same protocol.
+ */
+export function createExecChannel(
+  send: (value: unknown) => void,
+  close: () => void,
   serverPort: number | undefined,
   opts: ExecChannelOptions,
-): void {
+): ExecChannelHandlers {
   let authed = false;
   const subscriptions = new Map<number, { destroy: () => void }>();
   const ssePrefixes = opts.ssePrefixes ?? [];
 
-  const send = (value: unknown) => {
-    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(value));
-  };
-
   const authTimer = setTimeout(() => {
-    if (!authed) ws.close();
+    if (!authed) close();
   }, AUTH_TIMEOUT_MS);
   authTimer.unref?.();
 
@@ -121,10 +130,10 @@ function wireExecSocket(
     subscriptions.set(sub, { destroy: () => upstream.destroy() });
   };
 
-  ws.on("message", (data) => {
+  const onMessage = (data: string) => {
     let msg: ExecMessage;
     try {
-      msg = JSON.parse(data.toString()) as ExecMessage;
+      msg = JSON.parse(data) as ExecMessage;
     } catch {
       return;
     }
@@ -134,7 +143,7 @@ function wireExecSocket(
         clearTimeout(authTimer);
         send({ ready: true });
       } else {
-        ws.close();
+        close();
       }
       return;
     }
@@ -173,14 +182,35 @@ function wireExecSocket(
         exitCode: err ? ((err as ExecException).code ?? 1) : 0,
       });
     });
-  });
+  };
 
-  ws.on("error", () => ws.close());
-  ws.on("close", () => {
+  const onClose = () => {
     clearTimeout(authTimer);
     for (const sub of subscriptions.values()) sub.destroy();
     subscriptions.clear();
-  });
+  };
+
+  return { onMessage, onClose };
+}
+
+function wireExecSocket(
+  ws: WebSocket,
+  serverPort: number | undefined,
+  opts: ExecChannelOptions,
+): void {
+  const send = (value: unknown) => {
+    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(value));
+  };
+  const { onMessage, onClose } = createExecChannel(
+    send,
+    () => ws.close(),
+    serverPort,
+    opts,
+  );
+
+  ws.on("message", (data) => onMessage(data.toString()));
+  ws.on("error", () => ws.close());
+  ws.on("close", onClose);
 }
 
 /**

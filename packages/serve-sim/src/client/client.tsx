@@ -33,6 +33,7 @@ import { SimulatorResizeCornerHandle } from "./components/simulator-resize-corne
 import { ScreenshotToast } from "./components/screenshot-toast";
 import { SimulatorResizeSizeBadge } from "./components/simulator-resize-size-badge";
 import { ToolsPanel } from "./components/tools-panel";
+import { NetworkInspectorPanel } from "./components/network-inspector-tool";
 import { WebKitDevtoolsPanel } from "./components/webkit-devtools-panel";
 import { useMediaDrop } from "./hooks/use-media-drop";
 import { useMjpegStream } from "./hooks/use-mjpeg-stream";
@@ -54,6 +55,7 @@ import { hidUsageForCode } from "./utils/hid";
 import {
   DEVTOOLS_PANEL_WIDTH,
   GRID_PANEL_WIDTH,
+  NETWORK_PANEL_WIDTH,
   PANEL_WIDTH,
 } from "./utils/panel-widths";
 import { simEndpoint, streamConfigFrom } from "./utils/sim-endpoint";
@@ -516,6 +518,13 @@ function AppWithConfig({
     360,
     1400,
   );
+  const [networkOpen, setNetworkOpen] = useState(false);
+  const { width: networkPanelWidth, onPointerDown: onNetworkResize } = useResizableWidth(
+    "serve-sim:network-panel-width",
+    NETWORK_PANEL_WIDTH,
+    480,
+    1500,
+  );
   const [viewportWidth, setViewportWidth] = useState(
     () => (typeof window !== "undefined" ? window.innerWidth : 0),
   );
@@ -698,6 +707,8 @@ function AppWithConfig({
     ? devtoolsPanelWidth
     : gridOpen
     ? gridPanelWidth
+    : networkOpen
+    ? networkPanelWidth
     : panelOpen
     ? toolsPanelWidth
     : 0;
@@ -931,12 +942,13 @@ function AppWithConfig({
 
       {/* Right-edge sidebar rail. */}
       <div
-        className={`fixed top-3 right-3 flex flex-col gap-1 p-1 bg-panel-bg border border-white/8 rounded-[10px] backdrop-blur-[12px] [-webkit-backdrop-filter:blur(12px)] [transition:opacity_0.18s_ease] z-40 ${(panelOpen || devtoolsOpen || gridOpen) ? "opacity-0 pointer-events-none" : "opacity-100 pointer-events-auto"}`}
+        className={`fixed top-3 right-3 flex flex-col gap-1 p-1 bg-panel-bg border border-white/8 rounded-[10px] backdrop-blur-[12px] [-webkit-backdrop-filter:blur(12px)] [transition:opacity_0.18s_ease] z-40 ${(panelOpen || devtoolsOpen || gridOpen || networkOpen) ? "opacity-0 pointer-events-none" : "opacity-100 pointer-events-auto"}`}
       >
         <button
           onClick={() => {
             setDevtoolsOpen(false);
             setGridOpen(false);
+            setNetworkOpen(false);
             setPanelOpen((o) => !o);
           }}
           className="w-[30px] h-[30px] flex items-center justify-center bg-transparent border-none rounded-md text-[#8e8e93] cursor-pointer [transition:background_0.15s_ease,color_0.15s_ease] hover:bg-white/8 hover:text-white"
@@ -953,6 +965,7 @@ function AppWithConfig({
           onClick={() => {
             setPanelOpen(false);
             setGridOpen(false);
+            setNetworkOpen(false);
             setDevtoolsOpen((o) => !o);
           }}
           className="w-[30px] h-[30px] flex items-center justify-center bg-transparent border-none rounded-md text-[#8e8e93] cursor-pointer [transition:background_0.15s_ease,color_0.15s_ease] hover:bg-white/8 hover:text-white"
@@ -970,6 +983,7 @@ function AppWithConfig({
           onClick={() => {
             setPanelOpen(false);
             setDevtoolsOpen(false);
+            setNetworkOpen(false);
             setGridOpen((o) => !o);
           }}
           className="w-[30px] h-[30px] flex items-center justify-center bg-transparent border-none rounded-md text-[#8e8e93] cursor-pointer [transition:background_0.15s_ease,color_0.15s_ease] hover:bg-white/8 hover:text-white"
@@ -982,6 +996,25 @@ function AppWithConfig({
             <rect x="14" y="3" width="7" height="7" rx="1.5" />
             <rect x="3" y="14" width="7" height="7" rx="1.5" />
             <rect x="14" y="14" width="7" height="7" rx="1.5" />
+          </svg>
+        </button>
+        <button
+          onClick={() => {
+            setPanelOpen(false);
+            setDevtoolsOpen(false);
+            setGridOpen(false);
+            setNetworkOpen((o) => !o);
+          }}
+          className="w-[30px] h-[30px] flex items-center justify-center bg-transparent border-none rounded-md text-[#8e8e93] cursor-pointer [transition:background_0.15s_ease,color_0.15s_ease] hover:bg-white/8 hover:text-white"
+          aria-label="Open network inspector"
+          aria-pressed={networkOpen}
+          title="Network"
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M7 17 3 13l4-4" />
+            <path d="M3 13h12a4 4 0 0 0 4-4" />
+            <path d="m17 7 4 4-4 4" />
+            <path d="M21 11H9a4 4 0 0 0-4 4" />
           </svg>
         </button>
       </div>
@@ -1032,6 +1065,19 @@ function AppWithConfig({
         visible={devtoolsOpen}
         onPointerDown={onDevtoolsResize}
         ariaLabel="Resize WebKit DevTools panel"
+      />
+
+      <NetworkInspectorPanel
+        open={networkOpen}
+        onClose={() => setNetworkOpen(false)}
+        udid={config.device}
+        width={networkPanelWidth}
+      />
+      <ResizeHandle
+        panelWidth={networkPanelWidth}
+        visible={networkOpen}
+        onPointerDown={onNetworkResize}
+        ariaLabel="Resize network inspector panel"
       />
 
       {/* Status bar */}

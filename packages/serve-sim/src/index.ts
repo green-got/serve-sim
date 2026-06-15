@@ -2,7 +2,7 @@
 import { Command } from "commander";
 import { execSync, spawn as nodeSpawn, type ChildProcess } from "child_process";
 import { chmodSync, existsSync, mkdirSync, openSync, closeSync, readSync, readFileSync, unlinkSync, writeFileSync } from "fs";
-import { createHash } from "crypto";
+import { createHash, randomBytes } from "crypto";
 import { homedir, networkInterfaces } from "os";
 import { join, resolve } from "path";
 import { STATE_DIR, stateFileForDevice, listStateFiles } from "./state";
@@ -1799,7 +1799,10 @@ async function serve(servePort: number, devices: string[], portExplicit: boolean
   }
 
   const { simMiddleware } = await import("./middleware");
-  const middleware = simMiddleware({ basePath: "/", device: targetDevice });
+  // Own the token so we can publish it to the preview discovery file, which
+  // lets `serve-sim network` reach this server's token-gated routes.
+  const execToken = randomBytes(32).toString("base64url");
+  const middleware = simMiddleware({ basePath: "/", device: targetDevice, execToken });
 
   // Try requested port; if busy and the user didn't pin it, scan forward.
   const maxScan = portExplicit ? 1 : 50;
@@ -1830,6 +1833,28 @@ async function serve(servePort: number, devices: string[], portExplicit: boolean
     }
     process.exit(1);
   }
+
+  // Publish a discovery file so `serve-sim network` can find this preview
+  // server's origin + token. Cleaned up on exit.
+  const previewStateFile = join(STATE_DIR, "preview.json");
+  try {
+    mkdirSync(STATE_DIR, { recursive: true });
+    writeFileSync(
+      previewStateFile,
+      JSON.stringify({
+        pid: process.pid,
+        port: boundPort,
+        host,
+        url: `http://127.0.0.1:${boundPort}`,
+        execToken,
+        device: targetDevice ?? null,
+      }),
+    );
+  } catch {}
+  const cleanupPreviewState = () => {
+    try { unlinkSync(previewStateFile); } catch {}
+  };
+  process.on("exit", cleanupPreviewState);
 
   const exposedToLan = host !== "127.0.0.1" && host !== "localhost" && host !== "::1";
   const networkIP = getLocalNetworkIP();
@@ -1999,5 +2024,18 @@ program
   .helpOption(false)
   .argument("[args...]")
   .action((args: string[]) => uiSettings(args));
+
+program
+  .command("network")
+  .description(
+    "Inspect simulator network traffic: start|stop|status|ls|tail|export <har>|trust|untrust",
+  )
+  .allowUnknownOption(true)
+  .helpOption(false)
+  .argument("[args...]")
+  .action(async (args: string[]) => {
+    const { networkCli } = await import("./network/cli");
+    await networkCli(args);
+  });
 
 await program.parseAsync(process.argv);

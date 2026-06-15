@@ -6,7 +6,9 @@ import createDebug from "debug";
 //   serve-sim:helper   — helper spawn / readiness / exit
 //   serve-sim:mw       — middleware state selection + stale-helper recycling
 //   serve-sim:cli      — top-level command dispatch
+//   serve-sim:net      — network inspector (MITM proxy, system proxy, CA trust)
 export const debugCli = createDebug("serve-sim:cli");
 export const debugHelper = createDebug("serve-sim:helper");
 export const debugState = createDebug("serve-sim:state");
 export const debugMw = createDebug("serve-sim:mw");
+export const debugNet = createDebug("serve-sim:net");

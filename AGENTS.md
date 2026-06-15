@@ -2,6 +2,36 @@
 - Prefer kebab-case for all TS/JS files.
 - Avoid low-opacity for icons.
 
+## The dev server reuses the production middleware
+
+The preview client (`packages/serve-sim/src/client/`) is served two ways, but
+they now share one transport and one route surface. Production wires
+`simMiddleware` (`src/middleware.ts`) onto a Node `http` server via
+`servePreview`; the live-reload dev server (`packages/serve-sim/dev.ts`) mounts
+the **same** `simMiddleware` on its own Node `http` server and only intercepts
+the handful of dev-only routes before delegating everything else to it.
+
+This means **most host endpoints need no dev-side work at all** — add a route,
+SSE channel, `ssePrefixes` entry, or `previewConfigForState` field to
+`simMiddleware` and `bun run dev` picks it up automatically, because dev runs
+that exact middleware. The control socket (`/exec-ws`) is likewise the
+production `handleUpgrade`, attached to dev's `server.on("upgrade", …)`.
+
+`dev.ts` overrides only what genuinely differs in dev:
+
+- `GET /` — serves the freshly-bundled client HTML instead of the inlined build.
+- `GET /__dev/reload` — browser auto-reload SSE.
+- `POST /grid/api/start` — boots a helper from local source
+  (`bun src/index.ts --detach`) rather than the published binary.
+- It passes `serveSimBin: SERVE_SIM_BIN` to `simMiddleware` so the sidebar's
+  `serve-sim …` CLI calls run from this checkout.
+
+So the rule is simply: **build new host behavior in `simMiddleware`** (and its
+shared helpers — `src/state.ts`, `src/network/routes.ts`, `src/exec-ws.ts`).
+Only touch `dev.ts` when the behavior must differ in dev (local source, the live
+HTML shell, or reload). Anything pulled into `dev.ts` that the production server
+should also have is a red flag that it belongs in the middleware instead.
+
 ## E2E testing with agent-browser
 
 The serve-sim web UI streams the iOS Simulator and forwards clicks, so end-to-end
@@ -34,6 +64,13 @@ through `serve-sim` subcommands against a running server:
   --json` dumps all. Verify sets via `simctl ui <udid> <option>` readback or
   `simctl spawn <udid> defaults read` on com.apple.Accessibility /
   com.apple.mediaaccessibility / com.apple.UIKit.
+- `serve-sim network <start|stop|status|ls|tail|get <id>|export <har>|trust|untrust|clear>` —
+  Proxyman-style HTTP(S) inspection. Talks to the running preview server
+  (discovered via `$TMPDIR/serve-sim/preview.json`), so a `serve-sim` preview
+  must be up. `start` runs a local MITM proxy, points the macOS system proxy at
+  it, and trusts the serve-sim CA in the sim; HTTPS only decrypts after the app
+  is relaunched. `stop` always restores the prior system proxy. `--decrypt
+  a.com,b.com` limits TLS interception; `export out.har` writes HAR 1.2.
 - `xcrun simctl openurl booted <url>` — deep-link into apps (faster than
   tapping through Expo Go's recent-projects list).
 
