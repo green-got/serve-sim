@@ -66,6 +66,7 @@ import {
   DEVTOOLS_PANEL_WIDTH,
   PANEL_WIDTH,
 } from "./utils/panel-widths";
+import { proxyPreviewConfigForBrowser } from "./utils/preview-config";
 import { simEndpoint, streamConfigFrom } from "./utils/sim-endpoint";
 import {
   SIMULATOR_RESIZE_DRAG_TRANSITION,
@@ -123,7 +124,9 @@ function DeviceSidebarToggle({ open, onClick }: { open: boolean; onClick: () => 
 }
 
 function App() {
-  const [config, setConfig] = useState<PreviewConfig | null>(() => streamConfigFrom(window.__SIM_PREVIEW__));
+  const [config, setConfig] = useState<PreviewConfig | null>(() =>
+    proxyPreviewConfigForBrowser(streamConfigFrom(window.__SIM_PREVIEW__), window.location)
+  );
   const [streaming, setStreaming] = useState(false);
   // The device the user wants to view. Selecting a row in the sidebar updates
   // this and re-subscribes the SSE below — the main view swaps streams instantly
@@ -280,6 +283,7 @@ function App() {
 
     const applyConfig = (next: PreviewConfig | null) => {
       setConfig((prev) => {
+        next = proxyPreviewConfigForBrowser(streamConfigFrom(next), window.location);
         if (previewConfigKey(prev) === previewConfigKey(next)) return prev;
         if (next) {
           window.__SIM_PREVIEW__ = next;
@@ -480,8 +484,12 @@ function AppWithConfig({
   useEffect(() => {
     window.localStorage.setItem(CODEC_PREFERENCE_STORAGE_KEY, codecPreference);
   }, [codecPreference]);
+  // The server can pin the stream codec (`serve-sim --codec mjpeg`) for hosts
+  // whose hardware can't encode H.264 — e.g. VMs lacking the high/low-latency
+  // H.264 profiles. Treat that as a hard override the viewer can't switch off.
+  const serverForcesMjpeg = config.codec === "mjpeg";
   const useAvccVideo =
-    avcc.supported && !avccFallback.fellBack && !preferMjpeg && !forceMjpeg && codecPreference !== "mjpeg";
+    !serverForcesMjpeg && avcc.supported && !avccFallback.fellBack && !preferMjpeg && !forceMjpeg && codecPreference !== "mjpeg";
   const mjpeg = useMjpegStream(useAvccVideo ? null : config.streamUrl);
 
   // Re-arm AVCC whenever the target stream changes (device switch / reconnect).
@@ -947,6 +955,7 @@ function AppWithConfig({
             const streamView = (
               <SimulatorView
                 url={config.url}
+                wsUrl={config.wsUrl}
                 style={{
                   width: "100%",
                   height: "100%",

@@ -20,7 +20,7 @@ import { readdirSync, readFileSync, existsSync, watch } from "fs";
 import { spawn } from "child_process";
 import { randomBytes } from "crypto";
 import type { IncomingMessage, ServerResponse } from "http";
-import type { Duplex } from "stream";
+import type { Socket } from "net";
 import { join, resolve } from "path";
 import tailwindPlugin from "bun-plugin-tailwind";
 import {
@@ -54,13 +54,15 @@ const EXEC_TOKEN = randomBytes(32).toString("base64url");
 // The same connect-style middleware production runs. `basePath: "/"` normalizes
 // to an empty base internally, matching the `previewConfigForState(state, "")`
 // endpoints we inject into the dev HTML shell below.
-const middleware = simMiddleware({ basePath: "/", execToken: EXEC_TOKEN });
+// The dev server owns its HTTP server and forwards upgrades (below), so it
+// proxies helper/DevTools sockets through the single port like production.
+const middleware = simMiddleware({ basePath: "/", execToken: EXEC_TOKEN, proxyHelpers: true });
 
 // The dev server serves at the root (empty base), so endpoints look like
 // `/logs`, `/grid/api`, etc. We point the advertised CLI binary at our local
 // source so the sidebar's `serve-sim …` calls run from this checkout.
 function devPreviewConfig(state: ServeSimState) {
-  return previewConfigForState(state, "", SERVE_SIM_BIN, EXEC_TOKEN);
+  return previewConfigForState(state, "", SERVE_SIM_BIN, EXEC_TOKEN, undefined, true);
 }
 
 // ─── Client bundler with watch ───
@@ -305,9 +307,10 @@ function devMiddleware(req: IncomingMessage, res: ServerResponse, next: () => vo
 
   middleware(req, res, next);
 }
-// Forward the exec WebSocket upgrade to the production middleware's handler.
-devMiddleware.handleUpgrade = (req: IncomingMessage, socket: Duplex, head: Buffer): boolean =>
-  middleware.handleUpgrade?.(req, socket, head) ?? false;
+// Forward WebSocket upgrades (exec control + helper/DevTools proxy sockets) to
+// the production middleware's handler.
+devMiddleware.handleUpgrade = (req: IncomingMessage, socket: Socket, head: Buffer): void =>
+  middleware.handleUpgrade(req, socket, head);
 
 await servePreview({ port: PORT, middleware: devMiddleware });
 

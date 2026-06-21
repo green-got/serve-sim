@@ -1,6 +1,9 @@
 - Test-driven development where possible.
 - Prefer kebab-case for all TS/JS files.
 - Avoid low-opacity for icons.
+- Only support maintained Node.js LTS releases (currently Node 20+). Don't add
+  workarounds for end-of-life Node versions; rely on `ws` (a dependency) rather
+  than a global `WebSocket` so the middleware works across supported runtimes.
 
 ## E2E testing with agent-browser
 

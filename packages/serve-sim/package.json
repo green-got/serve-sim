@@ -21,7 +21,7 @@
     "serve-sim": "dist/serve-sim.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "files": [
     "dist/serve-sim.js",
