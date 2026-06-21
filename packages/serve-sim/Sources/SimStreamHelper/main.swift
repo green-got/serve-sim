@@ -56,8 +56,29 @@ var h264Encoding = false // backpressure flag (H.264)
 // so the freshly-configured decoder has a keyframe to start from.
 var forceKeyframe = false
 
+// ─── H.264 capability probe ───
+// VideoToolbox H.264 encode silently no-ops on some virtualized macOS hosts:
+// `VTCompressionSessionCreate` succeeds but no encoded frame is ever produced.
+// At startup we feed a few captured frames through the encoder — independent of
+// any AVCC viewer — and watch for output, so the preview can default to MJPEG
+// immediately instead of stalling on a frozen seed. All probe state is touched
+// only on `h264Queue`.
+var h264Decided = false       // true once support is known either way
+var h264OK = false            // decided AND VideoToolbox actually encodes
+var h264ProbeStart: Date?     // first probe frame's timestamp
+let h264ProbeTimeout: TimeInterval = 3.0
+
 // H.264 output → AVCC envelope → broadcast to /stream.avcc clients.
 h264Encoder.onEncoded = { encoded in
+    // First successful output proves VideoToolbox H.264 works on this host.
+    h264Queue.async {
+        if !h264Decided {
+            h264Decided = true
+            h264OK = true
+            print("[h264] probe: VideoToolbox H.264 encode OK")
+            httpServer.clientManager.setH264Supported(true)
+        }
+    }
     if let description = encoded.description {
         httpServer.clientManager.broadcastAvcc(AVCCEnvelope.description(avcc: description), isDescription: true)
     }
@@ -165,12 +186,31 @@ let frameHandler: (CVPixelBuffer, CMTime) -> Void = { pixelBuffer, timestamp in
         }
     }
 
-    // H.264 path runs only while at least one AVCC viewer is connected, so an
-    // all-MJPEG session pays no VideoToolbox cost. Its own backpressure flag
-    // lets it skip independently of the JPEG encoder.
-    if httpServer.clientManager.hasAvccClients() {
+    // H.264 path runs while an AVCC viewer is connected (so an all-MJPEG
+    // session pays no VideoToolbox cost) OR while the startup probe is still
+    // deciding whether this host can encode H.264 at all. Its own backpressure
+    // flag lets it skip independently of the JPEG encoder.
+    if httpServer.clientManager.hasAvccClients() || !h264Decided {
         h264Queue.async {
             if h264Encoding { return }
+            if !h264Decided {
+                // Drive the one-shot probe: force the first frame to a keyframe
+                // so VideoToolbox produces an IDR fast, and give up (→ MJPEG)
+                // if nothing comes back within the timeout.
+                if h264ProbeStart == nil {
+                    h264ProbeStart = Date()
+                    forceKeyframe = true
+                } else if Date().timeIntervalSince(h264ProbeStart!) > h264ProbeTimeout {
+                    h264Decided = true
+                    h264OK = false
+                    print("[h264] probe: no VideoToolbox output in \(Int(h264ProbeTimeout))s — viewers will use MJPEG")
+                    httpServer.clientManager.setH264Supported(false)
+                    return
+                }
+            } else if !h264OK || !httpServer.clientManager.hasAvccClients() {
+                // Decided unsupported, or no viewers: nothing to encode.
+                return
+            }
             h264Encoding = true
             let force = forceKeyframe
             forceKeyframe = false
