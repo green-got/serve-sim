@@ -7,7 +7,6 @@ export type { AxElement, AxRect, AxSnapshot } from "./ax-shared";
 const MAX_ELEMENTS = 500;
 const POLL_INTERVAL_MS = 500;
 const MAX_POLL_INTERVAL_MS = 2000;
-const UNAVAILABLE_RETRY_INTERVAL_MS = 15_000;
 
 interface RawAxeNode {
   AXUniqueId: string | null;
@@ -175,11 +174,11 @@ function createAxStreamer({ udid }: { udid: string }): AxStreamer {
         pollIntervalMs = Math.min(pollIntervalMs * 2, MAX_POLL_INTERVAL_MS);
       }
       latestMessage = nextMessage;
-      // If the helper says AX is unavailable (framework missing, sim
-      // booting), keep polling but back off so we recover automatically
-      // without spamming requests.
+      // AX is commonly unavailable while a simulator boots or changes its
+      // foreground app. Retry promptly so clients do not inherit a long
+      // startup delay from one transient failure.
       if (isAxUnavailableSnapshot(next)) {
-        pollIntervalMs = UNAVAILABLE_RETRY_INTERVAL_MS;
+        pollIntervalMs = POLL_INTERVAL_MS;
       }
     } finally {
       polling = false;
