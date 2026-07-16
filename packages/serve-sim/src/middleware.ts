@@ -31,6 +31,7 @@ import {
 } from "./devicekit-chrome";
 import { createExecUpgradeHandler, type UiRequestHandler } from "./exec-ws";
 import { UI_OPTIONS, getUiStatus, normalizeUiValue, setUiOption } from "./ui-settings";
+import type { PreviewInitialState } from "./preview-initial-state";
 
 type SimReq = IncomingMessage;
 type SimRes = ServerResponse;
@@ -868,6 +869,7 @@ export function previewConfigForState(
   execToken: string,
   codec?: string,
   proxyHelpers = false,
+  initialState?: PreviewInitialState,
 ): ServeSimState & {
   basePath: string;
   appStateEndpoint: string;
@@ -884,6 +886,7 @@ export function previewConfigForState(
   previewEndpoint: string;
   execToken: string;
   codec?: string;
+  initialState?: PreviewInitialState;
   proxyHelpers?: boolean;
 } {
   const gridApiBase = (base === "" ? "" : base) + "/grid/api";
@@ -904,6 +907,7 @@ export function previewConfigForState(
     previewEndpoint: base === "" ? "/" : base,
     execToken,
     ...(codec ? { codec } : {}),
+    ...(initialState ? { initialState } : {}),
     ...(proxyHelpers ? { proxyHelpers: true } : {}),
   };
 }
@@ -1243,6 +1247,8 @@ export interface SimMiddlewareOptions {
    * Reserved for future values such as `"hevc"`/`"av1"`.
    */
   codec?: string;
+  /** UI choices applied when a preview page initially loads. */
+  initialState?: PreviewInitialState;
   /**
    * Route the browser's helper stream/control and DevTools sockets through the
    * preview's same-origin `/helper` and `/devtools` proxies instead of the
@@ -1383,7 +1389,11 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         // Empty-state UI still polls /exec (boot/list helpers), so the page
         // needs the bearer token even before a helper attaches. Inject a
         // minimal config with just the basePath + token.
-        const minimal = JSON.stringify({ basePath: base, execToken });
+        const minimal = JSON.stringify({
+          basePath: base,
+          execToken,
+          ...(options?.initialState ? { initialState: options.initialState } : {}),
+        });
         html = html.replace(
           "<!--__SIM_PREVIEW_CONFIG__-->",
           `<script>window.__SIM_PREVIEW__=${minimal}</script>`,
@@ -1392,7 +1402,15 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
 
       if (state) {
         const remoteState = rewriteStateForRequestHost(state, hostForRequest(req), base, httpProtocolForRequest(req), proxyHelpers);
-        const config = JSON.stringify(previewConfigForState(remoteState, base, serveSimBinPath(), execToken, options?.codec, proxyHelpers));
+        const config = JSON.stringify(previewConfigForState(
+          remoteState,
+          base,
+          serveSimBinPath(),
+          execToken,
+          options?.codec,
+          proxyHelpers,
+          options?.initialState,
+        ));
         const configScript = `<script>window.__SIM_PREVIEW__=${config}</script>`;
         html = html.replace("<!--__SIM_PREVIEW_CONFIG__-->", configScript);
       }
@@ -1703,7 +1721,15 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         "Cache-Control": "no-store",
       });
       const remoteState = state ? rewriteStateForRequestHost(state, hostForRequest(req), base, httpProtocolForRequest(req), proxyHelpers) : null;
-      res.end(JSON.stringify(remoteState ? previewConfigForState(remoteState, base, serveSimBinPath(), execToken, options?.codec, proxyHelpers) : null));
+      res.end(JSON.stringify(remoteState ? previewConfigForState(
+        remoteState,
+        base,
+        serveSimBinPath(),
+        execToken,
+        options?.codec,
+        proxyHelpers,
+        options?.initialState,
+      ) : null));
       return;
     }
 
@@ -1767,7 +1793,15 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         const state = selectServeSimState(states, selectedDevice);
         const remoteState = state ? rewriteStateForRequestHost(state, hostForRequest(req), base, httpProtocolForRequest(req), proxyHelpers) : null;
         return JSON.stringify(
-          remoteState ? previewConfigForState(remoteState, base, serveSimBinPath(), execToken, options?.codec, proxyHelpers) : null,
+          remoteState ? previewConfigForState(
+            remoteState,
+            base,
+            serveSimBinPath(),
+            execToken,
+            options?.codec,
+            proxyHelpers,
+            options?.initialState,
+          ) : null,
         );
       };
 
