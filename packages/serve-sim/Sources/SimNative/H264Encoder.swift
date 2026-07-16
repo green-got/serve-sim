@@ -25,6 +25,7 @@ actor H264Encoder {
     }
 
     private var session: VTCompressionSession?
+    private var pool: CVPixelBufferPool?
     private var width: Int32 = 0
     private var height: Int32 = 0
     private let fps: Int32
@@ -57,6 +58,9 @@ actor H264Encoder {
         guard let session else {
             throw Errors.couldNotCreateSession
         }
+        guard let inputBuffer = copyBuffer(source) else {
+            throw Errors.couldNotCopyBuffer
+        }
 
         frameCount += 1
         let pts = CMTime(value: frameCount, timescale: fps)
@@ -74,7 +78,7 @@ actor H264Encoder {
             })
             let status = VTCompressionSessionEncodeFrame(
                 session,
-                imageBuffer: source,
+                imageBuffer: inputBuffer,
                 presentationTimeStamp: pts,
                 duration: .invalid,
                 frameProperties: frameProps,
@@ -87,11 +91,23 @@ actor H264Encoder {
             }
             if status != noErr {
                 request.resume(nil, failure: .submission(status))
+            } else {
+                let completionStatus = VTCompressionSessionCompleteFrames(
+                    session,
+                    untilPresentationTimeStamp: pts,
+                )
+                if completionStatus != noErr {
+                    request.resume(nil, failure: .completion(completionStatus))
+                }
             }
         }
         guard let buffer else {
             let failure = request.resolvedFailure() ?? .missingSampleBuffer
-            recoverFromEncodingFailure(failure)
+            if case .missingSampleBuffer = failure {
+                needsKeyframe = true
+            } else {
+                recoverFromEncodingFailure(failure)
+            }
             throw Errors.encodingFailed(failure)
         }
         let encoded = try extract(from: buffer)
@@ -104,9 +120,41 @@ actor H264Encoder {
             VTCompressionSessionInvalidate(session)
             self.session = nil
         }
+        pool = nil
     }
 
     // MARK: - private
+
+    private func copyBuffer(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+        guard let pool else { return nil }
+        var output: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(
+            kCFAllocatorDefault,
+            pool,
+            &output,
+        ) == kCVReturnSuccess, let output else { return nil }
+
+        CVPixelBufferLockBaseAddress(source, .readOnly)
+        CVPixelBufferLockBaseAddress(output, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(output, [])
+            CVPixelBufferUnlockBaseAddress(source, .readOnly)
+        }
+        guard let sourceAddress = CVPixelBufferGetBaseAddress(source),
+              let outputAddress = CVPixelBufferGetBaseAddress(output) else { return nil }
+        let sourceStride = CVPixelBufferGetBytesPerRow(source)
+        let outputStride = CVPixelBufferGetBytesPerRow(output)
+        let rows = CVPixelBufferGetHeight(source)
+        let copyBytes = min(sourceStride, outputStride)
+        for row in 0..<rows {
+            memcpy(
+                outputAddress + row * outputStride,
+                sourceAddress + row * sourceStride,
+                copyBytes,
+            )
+        }
+        return output
+    }
 
     private func rebuildSession() {
         if let session {
@@ -122,7 +170,7 @@ actor H264Encoder {
         // default spec on the rare hardware that rejects it.
         let hardwareSpec: NSDictionary = [
             kVTVideoEncoderSpecification_EnableLowLatencyRateControl: kCFBooleanTrue!,
-            kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: kCFBooleanTrue!,
+            kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: kCFBooleanTrue!,
         ]
         let softwareSpec: NSDictionary = [
             kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: kCFBooleanFalse!,
@@ -165,9 +213,23 @@ actor H264Encoder {
         }
         VTCompressionSessionPrepareToEncodeFrames(sess)
         session = sess
+        let attributes: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: Int(width),
+            kCVPixelBufferHeightKey as String: Int(height),
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+        ]
+        var newPool: CVPixelBufferPool?
+        CVPixelBufferPoolCreate(
+            kCFAllocatorDefault,
+            nil,
+            attributes as CFDictionary,
+            &newPool,
+        )
+        pool = newPool
         emittedDescription = false
         needsKeyframe = true
-        print("[h264] Encoder ready (\(encoderMode(sess)))")
+        print("[h264] Encoder ready (\(useSoftwareEncoder ? "software" : "hardware"))")
     }
 
     private func recoverFromEncodingFailure(_ failure: EncodeFailure) {
@@ -176,21 +238,11 @@ actor H264Encoder {
             VTCompressionSessionInvalidate(session)
             self.session = nil
         }
+        pool = nil
         useSoftwareEncoder = true
         emittedDescription = false
         needsKeyframe = true
         frameCount = 0
-    }
-
-    private func encoderMode(_ session: VTCompressionSession) -> String {
-        var value: CFTypeRef?
-        guard VTSessionCopyProperty(
-            session,
-            key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
-            allocator: kCFAllocatorDefault,
-            valueOut: &value,
-        ) == noErr else { return "unknown" }
-        return value as? Bool == true ? "hardware" : "software"
     }
 
     private func extract(from sample: CMSampleBuffer) throws -> Encoded {
@@ -265,6 +317,7 @@ actor H264Encoder {
 
     enum Errors: Error {
         case couldNotCreateSession
+        case couldNotCopyBuffer
         case encodingFailed(EncodeFailure)
         case invalidSampleBuffer
     }
@@ -273,6 +326,7 @@ actor H264Encoder {
 enum EncodeFailure: Error, Sendable {
     case timedOut
     case submission(OSStatus)
+    case completion(OSStatus)
     case callback(OSStatus)
     case missingSampleBuffer
 }
