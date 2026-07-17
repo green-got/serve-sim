@@ -34,8 +34,10 @@ actor H264Encoder {
     private var frameCount: Int64 = 0
     private var needsKeyframe = true
     private var useSoftwareEncoder = false
+    private var consecutiveMissingSampleBuffers = 0
 
     private static let encodeTimeout: Duration = .milliseconds(500)
+    private static let missingSampleBufferFallbackThreshold = 3
 
     init(fps: Int = 60, bitrate: Int = 6_000_000) {
         self.fps = Int32(fps)
@@ -105,12 +107,17 @@ actor H264Encoder {
             let failure = request.resolvedFailure() ?? .missingSampleBuffer
             if case .missingSampleBuffer = failure {
                 needsKeyframe = true
+                consecutiveMissingSampleBuffers += 1
+                if consecutiveMissingSampleBuffers >= Self.missingSampleBufferFallbackThreshold {
+                    recoverFromEncodingFailure(failure)
+                }
             } else {
                 recoverFromEncodingFailure(failure)
             }
             throw Errors.encodingFailed(failure)
         }
         let encoded = try extract(from: buffer)
+        consecutiveMissingSampleBuffers = 0
         needsKeyframe = false
         return encoded
     }
@@ -229,6 +236,7 @@ actor H264Encoder {
         pool = newPool
         emittedDescription = false
         needsKeyframe = true
+        consecutiveMissingSampleBuffers = 0
         print("[h264] Encoder ready (\(useSoftwareEncoder ? "software" : "hardware"))")
     }
 
@@ -243,6 +251,7 @@ actor H264Encoder {
         emittedDescription = false
         needsKeyframe = true
         frameCount = 0
+        consecutiveMissingSampleBuffers = 0
     }
 
     private func extract(from sample: CMSampleBuffer) throws -> Encoded {
