@@ -40,6 +40,7 @@ let artifactPromise: Promise<Artifact> | undefined;
 let shuttingDown = false;
 const SNAPSHOT_TIMEOUT_MS = 3_000;
 const STARTUP_TIMEOUT_MS = 90_000;
+const ARTIFACT_BUILD_STRATEGY = "iphonesimulator-sdk-v1";
 
 export function prewarmXCTestRunner(udid: string): void {
   let session = sessions.get(udid);
@@ -227,6 +228,7 @@ async function buildOrReuseArtifact(): Promise<Artifact> {
   const project = runnerProjectPath();
   const fingerprint = createHash("sha256")
     .update(spawnSync("xcodebuild", ["-version"], { encoding: "utf8" }).stdout || "")
+    .update(ARTIFACT_BUILD_STRATEGY)
     .update(hashDirectory(dirname(project)))
     .digest("hex")
     .slice(0, 16);
