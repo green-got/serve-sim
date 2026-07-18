@@ -47,10 +47,16 @@ final class RunnerTests: XCTestCase {
         self.receive(connection, data: combined)
         return
       }
-      let response = self.response(for: body)
-      connection.send(content: response, isComplete: true, completion: .contentProcessed { _ in
-        connection.cancel()
-      })
+      DispatchQueue.main.async { [weak self] in
+        guard let self else {
+          connection.cancel()
+          return
+        }
+        let response = self.response(for: body)
+        connection.send(content: response, isComplete: true, completion: .contentProcessed { _ in
+          connection.cancel()
+        })
+      }
     }
   }
 
