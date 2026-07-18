@@ -308,7 +308,14 @@ async function configureXctestrun(source: string, udid: string, port: number): P
   const merge = (target: Record<string, unknown>) => {
     if (!target.TestBundlePath) return;
     for (const key of ["EnvironmentVariables", "UITestEnvironmentVariables", "UITargetAppEnvironmentVariables", "TestingEnvironmentVariables"]) {
-      target[key] = { ...((target[key] as Record<string, string> | undefined) ?? {}), SERVE_SIM_XCTEST_PORT: String(port) };
+      const environment = (target[key] as Record<string, string> | undefined) ?? {};
+      target[key] = {
+        ...Object.fromEntries(Object.entries(environment).map(([name, value]) => [
+          name,
+          value.replaceAll("__PLATFORMS__/MacOSX.platform", "__PLATFORMS__/iPhoneSimulator.platform"),
+        ])),
+        SERVE_SIM_XCTEST_PORT: String(port),
+      };
     }
     target.PreferredScreenCaptureFormat = "screenshots";
     target.SystemAttachmentLifetime = "keepNever";
