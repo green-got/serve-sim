@@ -1,10 +1,30 @@
 import { describe, expect, test } from "bun:test";
 import {
   browserCameraVideoConstraints,
+  browserCameraH264ConfigPacket,
+  browserCameraH264FramePacket,
   browserCameraSocketUrl,
   browserVideoDevices,
   startBrowserCameraFrameLoop,
 } from "../client/utils/browser-camera";
+
+describe("browser camera H.264 packets", () => {
+  test("keeps decoder configuration distinct from encoded frames", () => {
+    expect([...new Uint8Array(browserCameraH264ConfigPacket(new Uint8Array([1, 100, 0, 31])))])
+      .toEqual([1, 1, 100, 0, 31]);
+    const chunk = {
+      type: "key",
+      byteLength: 4,
+      copyTo(target: AllowSharedBufferSource) {
+        const view = ArrayBuffer.isView(target)
+          ? new Uint8Array(target.buffer, target.byteOffset, target.byteLength)
+          : new Uint8Array(target);
+        view.set([0, 0, 0, 1]);
+      },
+    } as EncodedVideoChunk;
+    expect([...new Uint8Array(browserCameraH264FramePacket(chunk))]).toEqual([2, 1, 0, 0, 0, 1]);
+  });
+});
 
 describe("browserCameraVideoConstraints", () => {
   test("asks the browser for the stream size and rate sent to the simulator", () => {

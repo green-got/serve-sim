@@ -384,7 +384,6 @@ export function CameraTool({
         const replyBundles = Array.isArray(reply?.bundleIds) ? reply.bundleIds : null;
         const foregroundIsInjected =
           !!bundleId && (replyBundles ? replyBundles.includes(bundleId) : injectedBundleIds.has(bundleId));
-        const replySource = reply?.source ?? null;
         const replyHasActiveSource = !!reply && cameraStatusHasActiveSource(reply);
         const attachedToCurrentHelper =
           injected && alive && foregroundIsInjected && replyHasActiveSource

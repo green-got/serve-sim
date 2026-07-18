@@ -49,7 +49,8 @@
     "Package.swift",
     "Sources/SimNative/*.swift",
     "Sources/SimNative/build.sh",
-    "Sources/SimXCTestRunner/**/*"
+    "Sources/SimXCTestRunner/**/*",
+    "manifests/*.json"
   ],
   "exports": {
     "./middleware": {

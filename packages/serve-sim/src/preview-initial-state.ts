@@ -1,8 +1,8 @@
-export const PREVIEW_PANES = ["devices", "tools", "devtools"] as const;
+export const PREVIEW_PANES = ["devices", "tools", "devtools", "deep-links"] as const;
 
 export type PreviewPane = (typeof PREVIEW_PANES)[number];
 export type SimulatorTheme = "light" | "dark";
-export type PreviewRightPane = "tools" | "devtools";
+export type PreviewRightPane = "tools" | "devtools" | "deep-links";
 
 /** UI choices applied once when a preview page first loads. */
 export type PreviewInitialState = {
@@ -23,7 +23,7 @@ export function parsePreviewPanes(value: string): PreviewPane[] {
 
   if (panes.length === 1 && panes[0] === "none") return [];
   if (panes.length === 0 || panes.includes("none")) {
-    throw new Error("Expected 'none' or a comma-separated list of: devices, tools, devtools.");
+    throw new Error(`Expected 'none' or a comma-separated list of: ${PREVIEW_PANES.join(", ")}.`);
   }
 
   const invalid = panes.filter((pane) => !PREVIEW_PANES.includes(pane as PreviewPane));
@@ -45,6 +45,7 @@ export function parseSimulatorTheme(value: string): SimulatorTheme {
 export function selectInitialRightPane(
   panes: readonly PreviewPane[] | undefined,
 ): PreviewRightPane | null {
+  if (panes?.includes("deep-links")) return "deep-links";
   if (panes?.includes("devtools")) return "devtools";
   if (panes?.includes("tools")) return "tools";
   return null;

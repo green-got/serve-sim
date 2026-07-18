@@ -13,7 +13,7 @@ const PORT = 3461;
 
 function spawnNode(script: string): Promise<ChildProcess> {
   return new Promise((resolve, reject) => {
-    const child = spawn("node", ["-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(process.execPath, ["-e", script], { stdio: ["ignore", "pipe", "pipe"] });
     child.stdout!.once("data", () => resolve(child));
     child.once("error", reject);
     child.once("exit", (code) => reject(new Error(`child exited early (${code})`)));

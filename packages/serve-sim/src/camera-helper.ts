@@ -6,7 +6,7 @@ import { STATE_DIR } from "./state";
 
 export const CAMERA_STATE_DIR = join(STATE_DIR, "simcam");
 const HELPER_TIMEOUT_MS = 3000;
-const MAX_BROWSER_CAMERA_FRAME_BYTES = 1024 * 1024;
+const MAX_BROWSER_CAMERA_PACKET_BYTES = 2 * 1024 * 1024;
 
 interface InjectedBundlesState {
   helperPid: number;
@@ -110,21 +110,19 @@ export async function sendCameraHelperCommand(
   });
 }
 
-class BrowserCameraFrameStream {
+class BrowserCameraH264Stream {
   private socket: Socket | null = null;
   private buffer = Buffer.alloc(0);
+  private decoderConfiguration: Buffer | null = null;
   private pending: {
     resolve: (reply: CameraHelperReply) => void;
     reject: (error: Error) => void;
     timeout: ReturnType<typeof setTimeout>;
   } | null = null;
 
-  constructor(
-    private readonly socketPath: string,
-    private readonly onClose: () => void,
-  ) {}
+  constructor(private readonly socketPath: string) {}
 
-  async connect(): Promise<void> {
+  async connect(replayConfiguration = true): Promise<void> {
     if (this.socket) return;
     if (!existsSync(this.socketPath)) throw new Error("camera helper socket not found");
     const socket = net.createConnection(this.socketPath);
@@ -133,46 +131,59 @@ class BrowserCameraFrameStream {
     socket.on("data", (chunk) => this.handleData(
       Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk),
     ));
-    socket.on("error", (error) => this.close(error));
-    socket.on("close", () => this.close(new Error("camera frame stream closed")));
+    socket.on("error", (error) => this.closeSocket(socket, error));
+    socket.on("close", () => this.closeSocket(socket, new Error("camera frame stream closed")));
     await new Promise<void>((resolve, reject) => {
       socket.once("connect", resolve);
       socket.once("error", reject);
     });
     const ready = this.nextReply();
-    socket.write('{"action":"stream"}\n');
+    socket.write('{"action":"h264Stream"}\n');
     const reply = await ready;
     if (!reply.ok || reply.stream !== true) {
-      this.close(new Error(reply.error ?? "camera helper rejected frame stream"));
+      this.closeSocket(socket, new Error(reply.error ?? "camera helper rejected frame stream"));
       throw new Error(reply.error ?? "camera helper rejected frame stream");
+    }
+    if (replayConfiguration && this.decoderConfiguration) {
+      await this.writePacket(socket, this.decoderConfiguration);
     }
   }
 
-  async send(jpeg: Buffer): Promise<void> {
-    if (jpeg.length === 0 || jpeg.length > MAX_BROWSER_CAMERA_FRAME_BYTES) {
-      throw new Error("invalid browser camera frame");
+  async send(packet: Buffer): Promise<void> {
+    if (packet.length < 2 || packet.length > MAX_BROWSER_CAMERA_PACKET_BYTES
+        || (packet[0] !== 1 && packet[0] !== 2)) {
+      throw new Error("invalid browser camera H.264 packet");
     }
-    await this.connect();
+    const isConfiguration = packet[0] === 1;
+    await this.connect(!isConfiguration);
     const socket = this.socket;
     if (!socket) throw new Error("camera frame stream is unavailable");
+    if (isConfiguration) this.decoderConfiguration = Buffer.from(packet);
+    await this.writePacket(socket, packet);
+  }
+
+  private async writePacket(socket: Socket, packet: Buffer): Promise<void> {
     const length = Buffer.allocUnsafe(4);
-    length.writeUInt32BE(jpeg.length);
+    length.writeUInt32BE(packet.length);
     const reply = this.nextReply();
     socket.write(length);
-    socket.write(jpeg);
+    socket.write(packet);
     const result = await reply;
     if (!result.ok) throw new Error(result.error ?? "camera helper rejected browser frame");
   }
 
   destroy(): void {
-    this.close(new Error("camera frame stream closed"));
+    this.decoderConfiguration = null;
+    const socket = this.socket;
+    if (socket) this.closeSocket(socket, new Error("camera frame stream closed"));
   }
 
   private nextReply(): Promise<CameraHelperReply> {
     if (this.pending) return Promise.reject(new Error("camera frame already in flight"));
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
-        this.close(new Error("helper timeout"));
+        const socket = this.socket;
+        if (socket) this.closeSocket(socket, new Error("helper timeout"));
       }, HELPER_TIMEOUT_MS);
       this.pending = { resolve, reject, timeout };
     });
@@ -186,7 +197,8 @@ class BrowserCameraFrameStream {
     this.buffer = this.buffer.subarray(newline + 1);
     const pending = this.pending;
     if (!pending) {
-      this.close(new Error("unexpected camera helper reply"));
+      const socket = this.socket;
+      if (socket) this.closeSocket(socket, new Error("unexpected camera helper reply"));
       return;
     }
     this.pending = null;
@@ -198,9 +210,8 @@ class BrowserCameraFrameStream {
     }
   }
 
-  private close(error: Error): void {
-    const socket = this.socket;
-    if (!socket && !this.pending) return;
+  private closeSocket(socket: Socket, error: Error): void {
+    if (this.socket !== socket) return;
     this.socket = null;
     this.buffer = Buffer.alloc(0);
     if (this.pending) {
@@ -208,31 +219,27 @@ class BrowserCameraFrameStream {
       this.pending.reject(error);
       this.pending = null;
     }
-    if (socket && !socket.destroyed) socket.destroy();
-    this.onClose();
+    if (!socket.destroyed) socket.destroy();
   }
 }
 
-const browserCameraFrameStreams = new Map<string, BrowserCameraFrameStream>();
+const browserCameraFrameStreams = new Map<string, BrowserCameraH264Stream>();
 
-function browserCameraFrameStream(udid: string): BrowserCameraFrameStream {
+function browserCameraFrameStream(udid: string): BrowserCameraH264Stream {
   const existing = browserCameraFrameStreams.get(udid);
   if (existing) return existing;
-  const stream = new BrowserCameraFrameStream(cameraHelperSocketFile(udid), () => {
-    if (browserCameraFrameStreams.get(udid) === stream) {
-      browserCameraFrameStreams.delete(udid);
-    }
-  });
+  const stream = new BrowserCameraH264Stream(cameraHelperSocketFile(udid));
   browserCameraFrameStreams.set(udid, stream);
   return stream;
 }
 
 export function closeBrowserCameraFrameStream(udid: string): void {
   browserCameraFrameStreams.get(udid)?.destroy();
+  browserCameraFrameStreams.delete(udid);
 }
 
-export async function sendBrowserCameraFrame(udid: string, jpeg: Buffer): Promise<void> {
-  await browserCameraFrameStream(udid).send(jpeg);
+export async function sendBrowserCameraPacket(udid: string, packet: Buffer): Promise<void> {
+  await browserCameraFrameStream(udid).send(packet);
 }
 
 export function isCameraHelperAlive(udid: string): boolean {

@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
+import { ScreenshotToast } from "../client/components/screenshot-toast";
 import {
-  ScreenshotToast,
-  shouldDismissScreenshotToastAfterDrag,
-} from "../client/components/screenshot-toast";
-import type { ScreenshotToast as ScreenshotToastState } from "../client/hooks/use-screenshot-toast";
+  filenameFromContentDisposition,
+  type ScreenshotToast as ScreenshotToastState,
+} from "../client/hooks/use-screenshot-toast";
 
 const noop = () => {};
 
@@ -12,45 +12,41 @@ function render(toast: ScreenshotToastState): string {
   return renderToStaticMarkup(
     <ScreenshotToast
       toast={toast}
-      onReveal={noop}
-      onDismiss={noop}
+      onDownload={noop}
       onPause={noop}
       onResume={noop}
     />,
   );
 }
 
-describe("ScreenshotToast drag image", () => {
-  test("dismisses after a completed drag but not a cancelled drag", () => {
-    expect(shouldDismissScreenshotToastAfterDrag("copy")).toBe(true);
-    expect(shouldDismissScreenshotToastAfterDrag("move")).toBe(true);
-    expect(shouldDismissScreenshotToastAfterDrag("none")).toBe(false);
-  });
-
-  test("saved toast with a thumb renders an offscreen drag-image element", () => {
+describe("ScreenshotToast browser download", () => {
+  test("saved screenshot offers a browser download instead of a host Finder action", () => {
     const html = render({
       id: "1",
       status: "saved",
       phase: "in",
-      path: "/Users/x/Desktop/shot.png",
-      thumb: "data:image/png;base64,AAAA",
+      downloadUrl: "blob:shot",
+      filename: "shot.png",
+      thumb: "blob:shot",
     });
-    expect(html).toContain('data-testid="drag-image"');
-    // Parked far above the viewport via inline style — a Tailwind class here
-    // can silently miss the build scan, and position:fixed would resolve
-    // against the wrapper's -translate-x-1/2 containing block, both of which
-    // leave the image visible in the page.
-    expect(html).toMatch(/data-testid="drag-image"[^>]*style="[^"]*position:absolute/);
-    expect(html).toMatch(/data-testid="drag-image"[^>]*style="[^"]*top:-9999px/);
+    expect(html).toContain('aria-label="Download screenshot"');
+    expect(html).toContain("Screenshot Downloaded");
+    expect(html).toContain("Download again");
+    expect(html).not.toContain("Finder");
   });
 
-  test("toast without a thumb renders no drag-image element", () => {
-    const html = render({
-      id: "1",
-      status: "saved",
-      phase: "in",
-      path: "/Users/x/Desktop/shot.png",
-    });
-    expect(html).not.toContain('data-testid="drag-image"');
+  test("saving screenshot cannot be downloaded before the response arrives", () => {
+    const html = render({ id: "1", status: "saving", phase: "in" });
+    expect(html).toContain("Saving Screenshot");
+    expect(html).toContain("disabled");
+  });
+
+  test("extracts safe browser filenames from content-disposition", () => {
+    expect(filenameFromContentDisposition('attachment; filename="serve-sim-shot.png"'))
+      .toBe("serve-sim-shot.png");
+    expect(filenameFromContentDisposition("attachment; filename*=UTF-8''capture%20%C3%A9.png"))
+      .toBe("capture é.png");
+    expect(filenameFromContentDisposition('attachment; filename="../../escape.png"'))
+      .toBe("escape.png");
   });
 });

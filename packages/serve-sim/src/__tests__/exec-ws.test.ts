@@ -15,9 +15,15 @@ const PORT = 3461;
 const TOKEN = "exec-ws-test-token";
 
 let server: PreviewServer;
+const typedText: Array<{ device: string; text: string }> = [];
 
 beforeAll(async () => {
-  const middleware = simMiddleware({ basePath: "/", execToken: TOKEN, device: "DEVICE-A" });
+  const middleware = simMiddleware({
+    basePath: "/",
+    execToken: TOKEN,
+    device: "DEVICE-A",
+    typeText: async (device, text) => { typedText.push({ device, text }); },
+  });
   server = await servePreview({ port: PORT, middleware, host: "127.0.0.1" });
 });
 
@@ -31,6 +37,7 @@ interface Reply {
   stdout?: string;
   exitCode?: number;
   error?: string;
+  ok?: boolean;
   sub?: number;
   end?: boolean;
   data?: string;
@@ -108,6 +115,17 @@ describe("exec-ws control channel", () => {
     const reply = await channel.next();
     expect(reply.id).toBe(2);
     expect(reply.error).toMatch(/invalid device/i);
+    channel.close();
+  });
+
+  test("sends Unicode text through the semantic XCTest request", async () => {
+    typedText.length = 0;
+    const channel = await connect(TOKEN);
+    await channel.next(); // ready
+    channel.send({ id: 3, typeText: { device: "DEVICE-A", text: "azerty é !" } });
+    const reply = await channel.next();
+    expect(reply).toMatchObject({ id: 3, ok: true });
+    expect(typedText).toEqual([{ device: "DEVICE-A", text: "azerty é !" }]);
     channel.close();
   });
 

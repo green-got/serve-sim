@@ -12,7 +12,11 @@ import type { Socket } from "net";
 // importing the dependency keeps the proxy working regardless of runtime.
 import { WebSocket } from "ws";
 import { createAxStreamerCache } from "./ax";
-import { readCameraStatus, sendBrowserCameraFrame } from "./camera-helper";
+import {
+  closeBrowserCameraFrameStream,
+  readCameraStatus,
+  sendBrowserCameraPacket,
+} from "./camera-helper";
 import { serveSimExecutablePath } from "./binary-paths";
 import {
   closeDeviceSession,
@@ -35,10 +39,19 @@ import {
   serveDeviceKitChromeAsset,
   serveDevicePlaceholderAsset,
 } from "./devicekit-chrome";
-import { createExecUpgradeHandler, type UiRequestHandler } from "./exec-ws";
+import {
+  createExecUpgradeHandler,
+  type TypeTextRequestHandler,
+  type UiRequestHandler,
+} from "./exec-ws";
 import { UI_OPTIONS, getUiStatus, normalizeUiValue, setUiOption } from "./ui-settings";
-import { prewarmXCTestRunner, prewarmXCTestRunners } from "./xctest-runner";
+import {
+  prewarmXCTestRunner,
+  prewarmXCTestRunners,
+  xctestTypeText,
+} from "./xctest-runner";
 import type { PreviewInitialState } from "./preview-initial-state";
+import type { DeepLinkManifest } from "./deep-links";
 
 type SimReq = IncomingMessage;
 type SimRes = ServerResponse;
@@ -915,7 +928,7 @@ function attachHidInProcess(req: SimReq, socket: Socket, head: Buffer, device: s
   return true;
 }
 
-const MAX_BROWSER_CAMERA_FRAME_BYTES = 1024 * 1024;
+const MAX_BROWSER_CAMERA_PACKET_BYTES = 2 * 1024 * 1024;
 
 function attachBrowserCameraInProcess(
   req: SimReq,
@@ -923,7 +936,7 @@ function attachBrowserCameraInProcess(
   head: Buffer,
   device: string | null,
   execToken: string,
-  frameSink: (device: string, jpeg: Buffer) => Promise<void>,
+  packetSink: (device: string, packet: Buffer) => Promise<void>,
 ): boolean {
   if (!device || !isSimulatorUdid(device)) return false;
   if (!writeWebSocketAccept(req, socket)) return true;
@@ -931,15 +944,17 @@ function attachBrowserCameraInProcess(
   let authenticated = false;
   let closed = false;
   let processing = false;
+  let pendingConfig: Buffer | null = null;
   let latestFrame: Buffer | null = null;
 
   const send = (value: object) => channel.send(Buffer.from(JSON.stringify(value)));
   const drain = () => {
-    if (closed || processing || !latestFrame) return;
-    const frame = latestFrame;
-    latestFrame = null;
+    if (closed || processing || (!pendingConfig && !latestFrame)) return;
+    const packet = pendingConfig ?? latestFrame!;
+    if (pendingConfig) pendingConfig = null;
+    else latestFrame = null;
     processing = true;
-    void frameSink(device, frame)
+    void packetSink(device, packet)
       .catch((error) => send({
         error: error instanceof Error ? error.message : String(error),
       }))
@@ -965,21 +980,27 @@ function attachBrowserCameraInProcess(
       send({ ready: true });
       return;
     }
-    if (payload.length < 4 || payload.length > MAX_BROWSER_CAMERA_FRAME_BYTES
-        || payload[0] !== 0xff || payload[1] !== 0xd8) {
-      send({ error: "Invalid browser camera JPEG frame" });
+    const packetType = payload[0];
+    if (payload.length < 2 || payload.length > MAX_BROWSER_CAMERA_PACKET_BYTES
+        || (packetType !== 1 && packetType !== 2)) {
+      send({ error: "Invalid browser camera H.264 packet" });
       return;
     }
-    latestFrame = Buffer.from(payload);
+    if (packetType === 1) pendingConfig = Buffer.from(payload);
+    else latestFrame = Buffer.from(payload);
     drain();
   });
   channel.on("close", () => {
     closed = true;
+    pendingConfig = null;
     latestFrame = null;
+    closeBrowserCameraFrameStream(device);
   });
   channel.on("error", () => {
     closed = true;
+    pendingConfig = null;
     latestFrame = null;
+    closeBrowserCameraFrameStream(device);
   });
   return true;
 }
@@ -992,6 +1013,7 @@ export function previewConfigForState(
   codec?: string,
   proxyHelpers = false,
   initialState?: PreviewInitialState,
+  deepLinks?: DeepLinkManifest,
 ): ServeSimState & {
   basePath: string;
   appStateEndpoint: string;
@@ -1001,6 +1023,8 @@ export function previewConfigForState(
   cameraStatusEndpoint: string;
   cameraStreamEndpoint: string;
   devtoolsEndpoint: string;
+  deepLinkEndpoint: string;
+  screenshotEndpoint: string;
   serveSimBin: string;
   gridApiEndpoint: string;
   gridStartEndpoint: string;
@@ -1010,6 +1034,7 @@ export function previewConfigForState(
   execToken: string;
   codec?: string;
   initialState?: PreviewInitialState;
+  deepLinks?: DeepLinkManifest;
   proxyHelpers?: boolean;
 } {
   const gridApiBase = (base === "" ? "" : base) + "/grid/api";
@@ -1023,6 +1048,8 @@ export function previewConfigForState(
     cameraStatusEndpoint: `${base === "/" ? "" : base}/helper/${encodeURIComponent(state.device)}/camera/status`,
     cameraStreamEndpoint: `${base === "/" ? "" : base}/helper/${encodeURIComponent(state.device)}/camera/browser`,
     devtoolsEndpoint: endpoint(base, "/devtools", state.device),
+    deepLinkEndpoint: endpoint(base, "/api/deep-links/open", state.device),
+    screenshotEndpoint: endpoint(base, "/api/screenshot", state.device),
     serveSimBin,
     gridApiEndpoint: gridApiBase,
     gridStartEndpoint: gridApiBase + "/start",
@@ -1032,6 +1059,7 @@ export function previewConfigForState(
     execToken,
     ...(codec ? { codec } : {}),
     ...(initialState ? { initialState } : {}),
+    ...(deepLinks ? { deepLinks } : {}),
     ...(proxyHelpers ? { proxyHelpers: true } : {}),
   };
 }
@@ -1369,6 +1397,8 @@ export interface SimMiddlewareOptions {
   codec?: string;
   /** UI choices applied when a preview page initially loads. */
   initialState?: PreviewInitialState;
+  /** App-owned deep links exposed in the preview's right-side panel. */
+  deepLinks?: DeepLinkManifest;
   /**
    * Route the browser's helper stream/control and DevTools sockets through the
    * preview's same-origin `/helper` and `/devtools` proxies instead of the
@@ -1383,7 +1413,13 @@ export interface SimMiddlewareOptions {
   /** Test hook for supplying a fake inspect-webkit bridge. */
   inspectWebKitBridge?: () => Promise<WebKitBridge>;
   /** Test hook for accepting browser camera frames without a native helper. */
-  browserCameraFrameSink?: (device: string, jpeg: Buffer) => Promise<void>;
+  browserCameraPacketSink?: (device: string, packet: Buffer) => Promise<void>;
+  /** Test hook for opening a URL without invoking simctl. */
+  openDeepLink?: (device: string, url: string) => Promise<void>;
+  /** Test hook for capturing a simulator screenshot without invoking simctl. */
+  captureScreenshot?: (device: string) => Promise<Buffer>;
+  /** Test hook for semantic browser text input. */
+  typeText?: (device: string, text: string) => Promise<void>;
   /** Simulator XCTest runners to start before their first accessibility request. */
   prewarmDevices?: Iterable<string>;
 }
@@ -1417,7 +1453,35 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
   const devtoolsPrefix = devtoolsProxyPrefix(base);
   const proxyHelpers = options?.proxyHelpers ?? false;
   const getInspectWebKitBridge = options?.inspectWebKitBridge ?? ensureInspectWebKitBridge;
-  const browserCameraFrameSink = options?.browserCameraFrameSink ?? sendBrowserCameraFrame;
+  const browserCameraPacketSink = options?.browserCameraPacketSink ?? sendBrowserCameraPacket;
+  const typeText = options?.typeText ?? xctestTypeText;
+  const openDeepLink = options?.openDeepLink ?? ((device: string, deepLink: string) =>
+    new Promise<void>((resolve, reject) => {
+      execFile(
+        "xcrun",
+        ["simctl", "openurl", device, deepLink],
+        { encoding: "utf8", timeout: 10_000 },
+        (error, _stdout, stderr) => error
+          ? reject(new Error(stderr.trim() || error.message))
+          : resolve(),
+      );
+    }));
+  const captureScreenshot = options?.captureScreenshot ?? ((device: string) =>
+    new Promise<Buffer>((resolve, reject) => {
+      execFile(
+        "xcrun",
+        ["simctl", "io", device, "screenshot", "--type=png", "-"],
+        { encoding: null, maxBuffer: 32 * 1024 * 1024, timeout: 15_000 },
+        (error, stdout, stderr) => {
+          if (error) {
+            const message = Buffer.isBuffer(stderr) ? stderr.toString().trim() : String(stderr).trim();
+            reject(new Error(message || error.message));
+            return;
+          }
+          resolve(Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout));
+        },
+      );
+    }));
   // Per-process random token. Anyone who can read the preview HTML same-origin
   // can call /exec; cross-origin pages and LAN clients cannot, because they
   // can't read this value (it's only injected into the preview page's config).
@@ -1452,6 +1516,19 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       // Event-log recording is diagnostic; it must not fail the UI request.
     }
     return { ok: true };
+  };
+  const handleTypeTextRequest: TypeTextRequestHandler = async (payload) => {
+    const p = (payload ?? {}) as { device?: string; text?: string };
+    if (typeof p.device !== "string" || !/^[0-9A-Za-z-]+$/.test(p.device)) {
+      throw new Error("missing or invalid device udid");
+    }
+    if (typeof p.text !== "string" || p.text.length === 0) {
+      throw new Error("text must be a non-empty string");
+    }
+    if (Buffer.byteLength(p.text, "utf8") > 1024 * 1024) {
+      throw new Error("text input exceeds 1 MB");
+    }
+    await typeText(p.device, p.text);
   };
 
   const middleware = (async (req: SimReq, res: SimRes, next?: SimNext) => {
@@ -1519,6 +1596,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
           basePath: base,
           execToken,
           ...(options?.initialState ? { initialState: options.initialState } : {}),
+          ...(options?.deepLinks ? { deepLinks: options.deepLinks } : {}),
         });
         html = html.replace(
           "<!--__SIM_PREVIEW_CONFIG__-->",
@@ -1536,6 +1614,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
           options?.codec,
           proxyHelpers,
           options?.initialState,
+          options?.deepLinks,
         ));
         const configScript = `<script>window.__SIM_PREVIEW__=${config}</script>`;
         html = html.replace("<!--__SIM_PREVIEW_CONFIG__-->", configScript);
@@ -1855,6 +1934,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         options?.codec,
         proxyHelpers,
         options?.initialState,
+        options?.deepLinks,
       ) : null));
       return;
     }
@@ -1927,6 +2007,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
             options?.codec,
             proxyHelpers,
             options?.initialState,
+            options?.deepLinks,
           ) : null,
         );
       };
@@ -2023,6 +2104,118 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       const ax = axStreamerCache.get(state.device);
       const removeClient = ax.addClient(res);
       req.on("close", removeClient);
+      return;
+    }
+
+    if (url === base + "/api/deep-links/open" && req.method === "POST") {
+      if (!selectedDevice || !isSimulatorUdid(selectedDevice)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Missing or invalid simulator" }));
+        return;
+      }
+      if (!isJsonContentType(req.headers["content-type"])) {
+        res.writeHead(415, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unsupported Media Type" }));
+        return;
+      }
+      const origin = req.headers.origin;
+      if (origin) {
+        try {
+          if (new URL(origin).host !== req.headers.host) throw new Error("cross-origin");
+        } catch {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Cross-origin request blocked" }));
+          return;
+        }
+      }
+      const match = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? "");
+      if (!match || !safeEqualString(match[1]!.trim(), execToken)) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+      let body = "";
+      let tooLarge = false;
+      req.on("data", (chunk: Buffer | string) => {
+        body += typeof chunk === "string" ? chunk : chunk.toString();
+        if (body.length > 16 * 1024) {
+          tooLarge = true;
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Payload Too Large" }));
+          req.destroy();
+        }
+      });
+      req.on("end", () => {
+        if (tooLarge) return;
+        let deepLink = "";
+        try {
+          deepLink = (JSON.parse(body) as { url?: string }).url?.trim() ?? "";
+        } catch {}
+        if (deepLink.length === 0 || deepLink.length > 8_192
+            || !/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(deepLink)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Missing or invalid deep link URL" }));
+          return;
+        }
+        void openDeepLink(selectedDevice, deepLink)
+          .then(() => {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true }));
+          })
+          .catch((error) => {
+            if (!res.writableEnded) {
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+            }
+          });
+      });
+      return;
+    }
+
+    if (url === base + "/api/screenshot" && req.method === "POST") {
+      if (!selectedDevice || !isSimulatorUdid(selectedDevice)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Missing or invalid simulator" }));
+        return;
+      }
+      if (!isJsonContentType(req.headers["content-type"])) {
+        res.writeHead(415, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unsupported Media Type" }));
+        return;
+      }
+      const origin = req.headers.origin;
+      if (origin) {
+        try {
+          if (new URL(origin).host !== req.headers.host) throw new Error("cross-origin");
+        } catch {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Cross-origin request blocked" }));
+          return;
+        }
+      }
+      const match = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? "");
+      if (!match || !safeEqualString(match[1]!.trim(), execToken)) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+      req.resume();
+      try {
+        const png = await captureScreenshot(selectedDevice);
+        if (png.length === 0) throw new Error("Simulator returned an empty screenshot");
+        const filename = `serve-sim-screenshot-${new Date().toISOString().replace(/[:.]/g, "-")}.png`;
+        res.writeHead(200, {
+          "Content-Type": "image/png",
+          "Content-Length": png.length,
+          "Content-Disposition": `attachment; filename="${filename}"`,
+          "Cache-Control": "no-store",
+          "X-Content-Type-Options": "nosniff",
+        });
+        res.end(png);
+      } catch (error) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+      }
       return;
     }
 
@@ -2229,7 +2422,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         head,
         device,
         execToken,
-        browserCameraFrameSink,
+        browserCameraPacketSink,
       )) return;
       socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
       return;
@@ -2252,6 +2445,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       `${base}/ax`,
     ],
     onUiRequest: handleUiRequest,
+    onTypeTextRequest: handleTypeTextRequest,
     onCommandResult: (command, result) => recordCommandEvent(command, result),
   });
 

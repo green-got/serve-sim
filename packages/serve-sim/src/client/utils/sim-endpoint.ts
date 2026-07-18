@@ -15,6 +15,9 @@ declare global {
       eventLogEndpoint?: string;
       eventLogEventsEndpoint?: string;
       devtoolsEndpoint?: string;
+      deepLinkEndpoint?: string;
+      screenshotEndpoint?: string;
+      deepLinks?: import("../../deep-links").DeepLinkManifest;
       gridApiEndpoint?: string;
       gridStartEndpoint?: string;
       gridShutdownEndpoint?: string;
@@ -35,7 +38,7 @@ declare global {
       codec?: string;
       /** UI choices applied once when this preview page loads. */
       initialState?: {
-        panes?: Array<"devices" | "tools" | "devtools">;
+        panes?: Array<"devices" | "tools" | "devtools" | "deep-links">;
         fit?: boolean;
       };
       /**

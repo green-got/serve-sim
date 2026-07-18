@@ -26,7 +26,7 @@ import {
   type StreamConfig,
 } from "./simulator";
 
-import { Globe, PanelRight, Upload } from "lucide-react";
+import { Globe, Link2, PanelRight, Upload } from "lucide-react";
 import { ReloadIcon } from "./icons";
 import { AxDomOverlay } from "./components/ax-dom-overlay";
 import { AxStateProvider } from "./components/ax-state-provider";
@@ -44,6 +44,7 @@ import {
   type CodecPreference,
 } from "./components/stream-settings-tool";
 import { WebKitDevtoolsPanel } from "./components/webkit-devtools-panel";
+import { DeepLinksPanel } from "./components/deep-links-panel";
 import { useMediaDrop } from "./hooks/use-media-drop";
 import { useMjpegStream } from "./hooks/use-mjpeg-stream";
 import { useAvccStream } from "./hooks/use-avcc-stream";
@@ -53,6 +54,7 @@ import { useSimulatorResize } from "./hooks/use-simulator-resize";
 import { useUploadToasts } from "./hooks/use-upload-toasts";
 import { useWebKitDevtools } from "./hooks/use-webkit-devtools";
 import { useGridDevices } from "./hooks/use-grid-devices";
+import { useSimulatorKeyboard } from "./hooks/use-simulator-keyboard";
 import type { DeviceKitChromeDescriptor } from "./utils/grid";
 import {
   avccFallbackReducer,
@@ -60,8 +62,7 @@ import {
   AVCC_FRAME_TIMEOUT_MS,
 } from "./avcc-fallback";
 import { fileExtension } from "./utils/drop";
-import { execOnHost, openHostEventStream } from "./utils/exec";
-import { hidUsageForCode } from "./utils/hid";
+import { execOnHost, hostTypeText, openHostEventStream } from "./utils/exec";
 import { DEVTOOLS_PANEL_WIDTH, PANEL_WIDTH } from "./utils/panel-widths";
 import { proxyPreviewConfigForBrowser } from "./utils/preview-config";
 import { selectInitialRightPane } from "../preview-initial-state";
@@ -101,6 +102,7 @@ function App() {
   });
   const [axOverlayEnabled, setAxOverlayEnabled] = useState(false);
   const [devtoolsOpen, setDevtoolsOpen] = useState(initialRightPane === "devtools");
+  const [deepLinksOpen, setDeepLinksOpen] = useState(initialRightPane === "deep-links");
   const [selectedDevtoolsTargetId, setSelectedDevtoolsTargetId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -258,6 +260,8 @@ function App() {
         setAxOverlayEnabled={setAxOverlayEnabled}
         devtoolsOpen={devtoolsOpen}
         setDevtoolsOpen={setDevtoolsOpen}
+        deepLinksOpen={deepLinksOpen}
+        setDeepLinksOpen={setDeepLinksOpen}
         selectedDevtoolsTargetId={selectedDevtoolsTargetId}
         setSelectedDevtoolsTargetId={setSelectedDevtoolsTargetId}
         streaming={streaming}
@@ -311,6 +315,8 @@ interface AppWithConfigProps {
   setAxOverlayEnabled: React.Dispatch<React.SetStateAction<boolean>>;
   devtoolsOpen: boolean;
   setDevtoolsOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  deepLinksOpen: boolean;
+  setDeepLinksOpen: React.Dispatch<React.SetStateAction<boolean>>;
   selectedDevtoolsTargetId: string | null;
   setSelectedDevtoolsTargetId: React.Dispatch<React.SetStateAction<string | null>>;
   streaming: boolean;
@@ -327,6 +333,8 @@ function AppWithConfig({
   setAxOverlayEnabled,
   devtoolsOpen,
   setDevtoolsOpen,
+  deepLinksOpen,
+  setDeepLinksOpen,
   selectedDevtoolsTargetId,
   setSelectedDevtoolsTargetId,
   streaming,
@@ -584,6 +592,13 @@ function AppWithConfig({
   const sendKey = useCallback((type: "down" | "up", usage: number) => {
     sendWs(0x06, { type, usage });
   }, [sendWs]);
+  const textQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const sendText = useCallback((text: string) => {
+    textQueueRef.current = textQueueRef.current
+      .catch(() => {})
+      .then(() => hostTypeText({ device: config.device, text }))
+      .catch((error) => console.error("Failed to type simulator text", error));
+  }, [config.device]);
 
   // Subscribe to app-state SSE.
   const [currentApp, setCurrentApp] = useState<{ bundleId: string; isReactNative: boolean; pid?: number } | null>(null);
@@ -608,6 +623,12 @@ function AppWithConfig({
     DEVTOOLS_PANEL_WIDTH,
     420,
     1400,
+  );
+  const { width: deepLinksPanelWidth, onPointerDown: onDeepLinksResize } = useResizableWidth(
+    "serve-sim:deep-links-panel-width",
+    380,
+    280,
+    720,
   );
   const [viewportWidth, setViewportWidth] = useState(
     () => (typeof window !== "undefined" ? window.innerWidth : 0),
@@ -662,74 +683,20 @@ function AppWithConfig({
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
-  const [simFocused, setSimFocused] = useState(true);
-  const simFocusedRef = useRef(true);
-  simFocusedRef.current = simFocused;
-  const pressedKeysRef = useRef<Set<number>>(new Set());
-
-  useEffect(() => {
-    const onPointerDown = (e: PointerEvent) => {
-      const inside = !!simContainerRef.current?.contains(e.target as Node);
-      setSimFocused(inside);
-    };
-    document.addEventListener("pointerdown", onPointerDown, true);
-    return () => document.removeEventListener("pointerdown", onPointerDown, true);
-  }, []);
-
-  useEffect(() => {
-    if (simFocused) return;
-    const held = pressedKeysRef.current;
-    if (held.size === 0) return;
-    for (const usage of held) sendWs(0x06, { type: "up", usage });
-    held.clear();
-  }, [simFocused, sendWs]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent, type: "down" | "up") => {
-      if (!simFocusedRef.current) return;
-      if (e.code === "KeyH" && e.metaKey && e.shiftKey) {
-        e.preventDefault();
-        if (type === "down" && !e.repeat) sendWs(0x04, { button: "home" });
-        return;
-      }
-      if ((e.code === "ArrowLeft" || e.code === "ArrowRight") && e.metaKey && !e.shiftKey && !e.altKey && !e.ctrlKey) {
-        e.preventDefault();
-        if (type === "down" && !e.repeat) {
-          rotateBy(e.code === "ArrowLeft" ? "left" : "right");
-        }
-        return;
-      }
-      if (e.code === "KeyA" && e.metaKey && e.shiftKey) {
-        e.preventDefault();
-        if (type === "down" && !e.repeat) {
-          execOnHost(`xcrun simctl ui ${config.device} appearance`).then((r) => {
-            const next = r.stdout.trim() === "dark" ? "light" : "dark";
-            return execOnHost(`xcrun simctl ui ${config.device} appearance ${next}`);
-          }).catch(() => {});
-        }
-        return;
-      }
-      if (e.code === "KeyK" && e.metaKey && !e.shiftKey && !e.altKey && !e.ctrlKey) {
-        e.preventDefault();
-        if (type === "down" && !e.repeat) sendWs(0x0c, {});
-        return;
-      }
-      const usage = hidUsageForCode(e.code);
-      if (usage == null) return;
-      e.preventDefault();
-      if (type === "down") pressedKeysRef.current.add(usage);
-      else pressedKeysRef.current.delete(usage);
-      sendWs(0x06, { type, usage });
-    };
-    const down = (e: KeyboardEvent) => onKey(e, "down");
-    const up = (e: KeyboardEvent) => onKey(e, "up");
-    window.addEventListener("keydown", down);
-    window.addEventListener("keyup", up);
-    return () => {
-      window.removeEventListener("keydown", down);
-      window.removeEventListener("keyup", up);
-    };
-  }, [sendWs, config.device, rotateBy]);
+  const { sinkRef: keyboardSinkRef, blur: blurSimulatorKeyboard } = useSimulatorKeyboard({
+    containerRef: simContainerRef,
+    sendText,
+    sendHid: sendKey,
+    onHome: () => sendWs(0x04, { button: "home" }),
+    onRotate: rotateBy,
+    onToggleAppearance: () => {
+      execOnHost(`xcrun simctl ui ${config.device} appearance`).then((result) => {
+        const next = result.stdout.trim() === "dark" ? "light" : "dark";
+        return execOnHost(`xcrun simctl ui ${config.device} appearance ${next}`);
+      }).catch(() => {});
+    },
+    onToggleSoftwareKeyboard: () => sendWs(0x0c, {}),
+  });
 
   const uploads = useUploadToasts();
   const screenshot = useScreenshotToast(config.device);
@@ -757,12 +724,14 @@ function AppWithConfig({
     viewportHeight,
     aspectRatio: containerAspectRatioValue,
     initialFit: initialState?.fit === true,
-    onStart: () => setSimFocused(false),
+    onStart: blurSimulatorKeyboard,
   });
 
   const PANEL_EDGE_OFFSET = 12;
   const rightPanelWidthPx = devtoolsOpen
     ? devtoolsPanelWidth
+    : deepLinksOpen
+    ? deepLinksPanelWidth
     : panelOpen
     ? toolsPanelWidth
     : 0;
@@ -837,6 +806,16 @@ function AppWithConfig({
           }}
           {...mediaDrop.dropZoneProps}
         >
+          <textarea
+            ref={keyboardSinkRef}
+            data-serve-sim-keyboard-sink
+            aria-hidden="true"
+            tabIndex={-1}
+            autoCapitalize="off"
+            autoComplete="off"
+            spellCheck={false}
+            className="absolute size-px opacity-0 pointer-events-none"
+          />
           {(() => {
             const streamView = (
               <SimulatorView
@@ -1007,11 +986,12 @@ function AppWithConfig({
 
       {/* Right-edge rail: tools + WebKit DevTools. */}
       <div
-        className={`fixed top-3 right-3 flex flex-col gap-1 p-1 bg-panel-bg border border-white/8 rounded-[10px] backdrop-blur-[12px] [-webkit-backdrop-filter:blur(12px)] [transition:opacity_0.18s_ease] z-40 ${(panelOpen || devtoolsOpen) ? "opacity-0 pointer-events-none" : "opacity-100 pointer-events-auto"}`}
+        className={`fixed top-3 right-3 flex flex-col gap-1 p-1 bg-panel-bg border border-white/8 rounded-[10px] backdrop-blur-[12px] [-webkit-backdrop-filter:blur(12px)] [transition:opacity_0.18s_ease] z-40 ${(panelOpen || devtoolsOpen || deepLinksOpen) ? "opacity-0 pointer-events-none" : "opacity-100 pointer-events-auto"}`}
       >
         <button
           onClick={() => {
             setDevtoolsOpen(false);
+            setDeepLinksOpen(false);
             setPanelOpen((o) => !o);
           }}
           className="w-[30px] h-[30px] flex items-center justify-center bg-transparent border-none rounded-md text-[#8e8e93] cursor-pointer [transition:background_0.15s_ease,color_0.15s_ease] hover:bg-white/8 hover:text-white"
@@ -1024,6 +1004,7 @@ function AppWithConfig({
         <button
           onClick={() => {
             setPanelOpen(false);
+            setDeepLinksOpen(false);
             setDevtoolsOpen((o) => !o);
           }}
           className="w-[30px] h-[30px] flex items-center justify-center bg-transparent border-none rounded-md text-[#8e8e93] cursor-pointer [transition:background_0.15s_ease,color_0.15s_ease] hover:bg-white/8 hover:text-white"
@@ -1033,6 +1014,21 @@ function AppWithConfig({
         >
           <Globe size={18} strokeWidth={1.75} />
         </button>
+        {config.deepLinks?.links.length && config.deepLinkEndpoint && config.execToken ? (
+          <button
+            onClick={() => {
+              setPanelOpen(false);
+              setDevtoolsOpen(false);
+              setDeepLinksOpen((open) => !open);
+            }}
+            className="w-[30px] h-[30px] flex items-center justify-center bg-transparent border-none rounded-md text-[#8e8e93] cursor-pointer [transition:background_0.15s_ease,color_0.15s_ease] hover:bg-white/8 hover:text-white"
+            aria-label="Open deep links"
+            aria-pressed={deepLinksOpen}
+            title="Deep links"
+          >
+            <Link2 size={18} strokeWidth={1.75} />
+          </button>
+        ) : null}
       </div>
 
       <ToolsPanel
@@ -1075,6 +1071,24 @@ function AppWithConfig({
         onPointerDown={onDevtoolsResize}
         ariaLabel="Resize WebKit DevTools panel"
       />
+      {config.deepLinks && config.deepLinkEndpoint && config.execToken ? (
+        <>
+          <DeepLinksPanel
+            open={deepLinksOpen}
+            onClose={() => setDeepLinksOpen(false)}
+            manifest={config.deepLinks}
+            endpoint={config.deepLinkEndpoint}
+            token={config.execToken}
+            width={deepLinksPanelWidth}
+          />
+          <ResizeHandle
+            panelWidth={deepLinksPanelWidth}
+            visible={deepLinksOpen}
+            onPointerDown={onDeepLinksResize}
+            ariaLabel="Resize deep links panel"
+          />
+        </>
+      ) : null}
     </div>
     </AxStateProvider>
   );

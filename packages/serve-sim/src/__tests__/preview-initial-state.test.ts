@@ -35,4 +35,8 @@ describe("selectInitialRightPane", () => {
   test("gives DevTools precedence when both right-side panes are requested", () => {
     expect(selectInitialRightPane(["tools", "devtools"])).toBe("devtools");
   });
+
+  test("gives an explicitly requested deep-link panel precedence", () => {
+    expect(selectInitialRightPane(["tools", "devtools", "deep-links"])).toBe("deep-links");
+  });
 });

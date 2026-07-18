@@ -54,6 +54,8 @@ describe("previewConfigForState", () => {
       cameraStatusEndpoint: "/preview/helper/DEVICE-B/camera/status",
       cameraStreamEndpoint: "/preview/helper/DEVICE-B/camera/browser",
       devtoolsEndpoint: "/preview/devtools?device=DEVICE-B",
+      deepLinkEndpoint: "/preview/api/deep-links/open?device=DEVICE-B",
+      screenshotEndpoint: "/preview/api/screenshot?device=DEVICE-B",
       serveSimBin: "/bin/serve-sim",
       gridApiEndpoint: "/preview/grid/api",
       gridStartEndpoint: "/preview/grid/api/start",

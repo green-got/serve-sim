@@ -87,6 +87,42 @@ export async function xctestDescribe(udid: string): Promise<string | null> {
   }
 }
 
+export async function xctestTypeText(udid: string, text: string): Promise<void> {
+  const session = await waitForRunnerSession(udid, 30_000);
+  const bundleId = session.foregroundBundleId ?? await refreshForeground(udid, session);
+  if (!bundleId) throw new Error("No foreground app is available for text input");
+
+  let response: RunnerResponse;
+  try {
+    response = await sendCommand(
+      session.port,
+      { command: "typeText", bundleId, text },
+      Math.max(5_000, Math.min(30_000, 3_000 + text.length * 20)),
+    );
+  } catch (error) {
+    degradeAndRestart(udid, session, error);
+    throw error;
+  }
+  if (!response.ok) throw new Error(response.error || "XCTest could not type text");
+}
+
+async function waitForRunnerSession(
+  udid: string,
+  timeoutMs: number,
+): Promise<RunnerSession & { port: number }> {
+  prewarmXCTestRunner(udid);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const session = sessions.get(udid);
+    if (session?.state === "ready" && session.port) {
+      return session as RunnerSession & { port: number };
+    }
+    await delay(50);
+  }
+  const error = sessions.get(udid)?.error;
+  throw new Error(error || "Timed out waiting for the XCTest runner");
+}
+
 export function invalidateXCTestForeground(udid: string): void {
   const session = sessions.get(udid);
   if (session) session.foregroundBundleId = undefined;
@@ -106,7 +142,7 @@ export function closeAllXCTestRunners(): void {
 
 async function startRunner(udid: string, session: RunnerSession, generation: number): Promise<void> {
   try {
-    const artifact = await ensureArtifact(udid);
+    const artifact = await ensureArtifact();
     if (session.generation !== generation || shuttingDown) return;
     const port = await freePort();
     const configured = await configureXctestrun(artifact.xctestrun, udid, port);
@@ -179,15 +215,15 @@ function scheduleRestart(udid: string, session: RunnerSession): void {
   }, 1_000);
 }
 
-async function ensureArtifact(udid: string): Promise<Artifact> {
-  artifactPromise ??= buildOrReuseArtifact(udid).catch((error) => {
+async function ensureArtifact(): Promise<Artifact> {
+  artifactPromise ??= buildOrReuseArtifact().catch((error) => {
     artifactPromise = undefined;
     throw error;
   });
   return artifactPromise;
 }
 
-async function buildOrReuseArtifact(udid: string): Promise<Artifact> {
+async function buildOrReuseArtifact(): Promise<Artifact> {
   const project = runnerProjectPath();
   const fingerprint = createHash("sha256")
     .update(spawnSync("xcodebuild", ["-version"], { encoding: "utf8" }).stdout || "")
@@ -201,10 +237,11 @@ async function buildOrReuseArtifact(udid: string): Promise<Artifact> {
   const result = await run("xcodebuild", [
     "-project", project,
     "-scheme", "AgentDeviceRunner",
-    "-destination", `platform=iOS Simulator,id=${udid}`,
+    "-sdk", "iphonesimulator",
     "-derivedDataPath", derivedData,
     "build-for-testing",
     "CODE_SIGNING_ALLOWED=NO",
+    "SUPPORTED_PLATFORMS=iphonesimulator",
   ], 180_000);
   if (result.code !== 0) {
     await rm(derivedData, { recursive: true, force: true });

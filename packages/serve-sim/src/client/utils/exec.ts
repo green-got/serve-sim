@@ -182,6 +182,20 @@ export interface UiRequestPayload {
   value?: string;
 }
 
+export interface TypeTextPayload {
+  device: string;
+  text: string;
+}
+
+export async function hostTypeText(
+  payload: TypeTextPayload,
+  opts?: { signal?: AbortSignal },
+): Promise<void> {
+  const reply = await socketRequest({ typeText: payload }, opts?.signal);
+  if (reply.error) throw new Error(reply.error);
+  if (!reply.ok) throw new Error("XCTest did not accept simulator text");
+}
+
 /**
  * Simulator-settings request, handled in-process by the preview server (just
  * the underlying simctl/ax-tool spawn — no `node <cli>` shell round-trip).

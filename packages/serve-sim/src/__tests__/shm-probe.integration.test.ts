@@ -18,9 +18,14 @@ const TABLE_BYTES = 4 + 4 + SURFACE_RING * 4;
 const CONTROL_BYTES = HEADER_BYTES + TABLE_BYTES;
 const DEFAULT_WIDTH = 1280;
 const DEFAULT_HEIGHT = 720;
-const GREEN_JPEG_BASE64 =
-  "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAACAAIDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFAEBAAAAAAAAAAAAAAAAAAAAB//EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/ALoAfAr/2Q==";
-const GREEN_JPEG = Buffer.from(GREEN_JPEG_BASE64, "base64");
+const GREEN_AVCC_CONFIG = Buffer.concat([
+  Buffer.from([1]),
+  Buffer.from("AULACv/hABZnQsAK3EJsBEAAAAMAQAAAAwEDxIngAQAFaM4PLIA=", "base64"),
+]);
+const GREEN_AVCC_KEYFRAME = Buffer.concat([
+  Buffer.from([2, 1]),
+  Buffer.from("AAAAIGWIggF/EYoAAyixwABOHjgACkPJycnXXXXXXXXXXXXg", "base64"),
+]);
 
 function helperReady(): boolean {
   try {
@@ -229,7 +234,7 @@ function sendHelperCommand(socketPath: string, cmd: object, timeoutMs = 3000): P
 }
 
 async function openHelperFrameStream(socketPath: string): Promise<{
-  send(jpeg: Buffer): Promise<any>;
+  send(packet: Buffer): Promise<any>;
   close(): void;
 }> {
   const socket = net.createConnection(socketPath);
@@ -267,15 +272,15 @@ async function openHelperFrameStream(socketPath: string): Promise<{
     socket.once("error", reject);
   });
   const ready = nextReply();
-  socket.write('{"action":"stream"}\n');
-  expect(await ready).toMatchObject({ ok: true, stream: true });
+  socket.write('{"action":"h264Stream"}\n');
+  expect(await ready).toMatchObject({ ok: true, stream: true, codec: "h264" });
 
   return {
-    async send(jpeg) {
+    async send(packet) {
       const length = Buffer.allocUnsafe(4);
-      length.writeUInt32BE(jpeg.length);
+      length.writeUInt32BE(packet.length);
       const reply = nextReply();
-      socket.write(Buffer.concat([length, jpeg]));
+      socket.write(Buffer.concat([length, packet]));
       return reply;
     },
     close() {
@@ -438,7 +443,7 @@ describeIf("SimCameraHelper shm probe", () => {
     expect(mirror.mirror).toBe("off");
   });
 
-  test("browser source streams multiple encoded frames without blocking controls", async () => {
+  test("browser source streams multiple H.264 frames without blocking controls", async () => {
     const switched = await sendHelperCommand(SOCKET_PATH, {
       action: "switch",
       source: "browser",
@@ -451,16 +456,17 @@ describeIf("SimCameraHelper shm probe", () => {
     const stream = await openHelperFrameStream(SOCKET_PATH);
     try {
       const before = readHeader(handle.buffer).frameSeq;
-      expect(await stream.send(GREEN_JPEG)).toMatchObject({ ok: true });
+      expect(await stream.send(GREEN_AVCC_CONFIG)).toMatchObject({ ok: true });
+      expect(await stream.send(GREEN_AVCC_KEYFRAME)).toMatchObject({ ok: true });
+      expect(await waitFor(() => readHeader(handle.buffer).frameSeq > before, 2_000)).toBe(true);
       const afterFirst = readHeader(handle.buffer).frameSeq;
-      expect(afterFirst).toBeGreaterThan(before);
 
       const status = await sendHelperCommand(SOCKET_PATH, { action: "status" });
       expect(status).toMatchObject({ ok: true, source: "browser" });
       expect(status.frameSeq).toBe(Number(afterFirst));
 
-      expect(await stream.send(GREEN_JPEG)).toMatchObject({ ok: true });
-      expect(readHeader(handle.buffer).frameSeq).toBeGreaterThan(afterFirst);
+      expect(await stream.send(GREEN_AVCC_KEYFRAME)).toMatchObject({ ok: true });
+      expect(await waitFor(() => readHeader(handle.buffer).frameSeq > afterFirst, 2_000)).toBe(true);
     } finally {
       stream.close();
       await closeShm(handle);

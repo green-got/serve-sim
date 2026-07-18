@@ -27,6 +27,8 @@ import { WebSocketServer, type WebSocket } from "ws";
 //   server → {id, stdout, stderr, exitCode}
 //   client → {id, ui:{…}}             simulator-settings request (in-process,
 //   server → {id, …} | {id, error}     no shell round-trip)
+//   client → {id, typeText:{…}}       semantic Unicode text via XCTest
+//   server → {id, ok:true} | {id, error}
 //   client → {sub, path}              subscribe to a same-origin SSE route
 //   server → {sub, data}              raw SSE bytes for that subscription
 //   server → {sub, end:true}          upstream closed
@@ -47,6 +49,7 @@ interface ExecMessage {
   id?: number;
   command?: string;
   ui?: unknown;
+  typeText?: unknown;
   sub?: number;
   path?: string;
   unsub?: number;
@@ -54,6 +57,7 @@ interface ExecMessage {
 
 /** In-process handler for `{id, ui}` requests; resolves to the reply body. */
 export type UiRequestHandler = (payload: unknown) => Promise<Record<string, unknown>>;
+export type TypeTextRequestHandler = (payload: unknown) => Promise<void>;
 export type CommandResultHandler = (
   command: string,
   result: { stdout: string; stderr: string; exitCode: number },
@@ -66,6 +70,8 @@ interface ExecChannelOptions {
   ssePrefixes?: string[];
   /** In-process handler for `{id, ui}` simulator-settings requests. */
   onUiRequest?: UiRequestHandler;
+  /** Semantic text input handled by the persistent XCTest runner. */
+  onTypeTextRequest?: TypeTextRequestHandler;
   /** Optional observer for completed shell commands. */
   onCommandResult?: CommandResultHandler;
 }
@@ -162,6 +168,20 @@ function wireExecSocket(
       opts
         .onUiRequest(msg.ui)
         .then((reply) => send({ id, ...reply }))
+        .catch((e: unknown) =>
+          send({ id, error: e instanceof Error ? e.message : String(e) }),
+        );
+      return;
+    }
+    if (typeof msg.id === "number" && msg.typeText !== undefined) {
+      const { id } = msg;
+      if (!opts.onTypeTextRequest) {
+        send({ id, error: "text input requests not supported" });
+        return;
+      }
+      opts
+        .onTypeTextRequest(msg.typeText)
+        .then(() => send({ id, ok: true }))
         .catch((e: unknown) =>
           send({ id, error: e instanceof Error ? e.message : String(e) }),
         );

@@ -33,6 +33,7 @@ import {
   sendCameraHelperCommand as sendHelperCommand,
 } from "./camera-helper";
 import { cameraArtifactPaths, firstExistingPath } from "./binary-paths";
+import { readDeepLinkManifest, type DeepLinkManifest } from "./deep-links";
 
 // `import.meta.dir` is Bun-only; resolve once via fileURLToPath so the bundled
 // CLI works under plain `node` too.
@@ -1599,6 +1600,7 @@ async function serve(
   codec: string | undefined,
   initialState: PreviewInitialState | undefined,
   theme: SimulatorTheme | undefined,
+  deepLinks: DeepLinkManifest | undefined,
 ) {
   // Boot the target simulators; the preview server streams them in-process
   // (no spawned helper). Sessions are created lazily on the first stream request.
@@ -1620,6 +1622,7 @@ async function serve(
     device: targetDevice,
     codec,
     initialState,
+    deepLinks,
     proxyHelpers: true,
     prewarmDevices: targetDevices,
   });
@@ -1714,7 +1717,7 @@ program
   .option("--no-preview", "Skip the web preview server; stream in foreground only")
   .option(
     "--panes <panes>",
-    "Initially open preview panes: devices, tools, devtools, or none",
+    "Initially open preview panes: devices, tools, devtools, deep-links, or none",
     (value) => {
       try {
         return parsePreviewPanes(value);
@@ -1724,6 +1727,17 @@ program
     },
   )
   .option("--fit", "Initially size the simulator to fit the preview viewport")
+  .option(
+    "--deep-links <path>",
+    "Load a JSON deep-link inventory for the preview panel",
+    (value) => {
+      try {
+        return readDeepLinkManifest(resolve(value));
+      } catch (error) {
+        throw new InvalidArgumentError(error instanceof Error ? error.message : String(error));
+      }
+    },
+  )
   .option(
     "--theme <theme>",
     "Set simulator appearance before opening the preview: light or dark",
@@ -1794,6 +1808,7 @@ Examples:
         opts.codec,
         initialState,
         opts.theme,
+        opts.deepLinks,
       );
     }
   });

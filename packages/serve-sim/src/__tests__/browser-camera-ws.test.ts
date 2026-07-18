@@ -7,16 +7,16 @@ const TOKEN = "browser-camera-token";
 const DEVICE = "12345678-1234-1234-1234-123456789ABC";
 
 let server: PreviewServer;
-const frames: Buffer[] = [];
+const packets: Buffer[] = [];
 
 beforeAll(async () => {
   const middleware = simMiddleware({
     basePath: "/",
     execToken: TOKEN,
     device: DEVICE,
-    browserCameraFrameSink: async (_device, jpeg) => {
+    browserCameraPacketSink: async (_device, packet) => {
       expect(_device).toBe(DEVICE);
-      frames.push(jpeg);
+      packets.push(packet);
     },
   });
   server = await servePreview({ port: PORT, middleware, host: "127.0.0.1" });
@@ -68,18 +68,20 @@ function connect(token: string): Promise<{
 }
 
 describe("browser camera WebSocket", () => {
-  test("authenticates and forwards JPEG frames to the selected device", async () => {
-    frames.length = 0;
+  test("authenticates and forwards H.264 configuration and frames to the selected device", async () => {
+    packets.length = 0;
     const channel = await connect(TOKEN);
     await channel.ready;
-    const frame = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+    const config = Buffer.from([1, 1, 100, 0, 31]);
+    const frame = Buffer.from([2, 1, 0, 0, 0, 1]);
+    channel.socket.send(config);
     channel.socket.send(frame);
 
     const deadline = Date.now() + 2_000;
-    while (frames.length === 0 && Date.now() < deadline) {
+    while (packets.length < 2 && Date.now() < deadline) {
       await Bun.sleep(10);
     }
-    expect(frames).toEqual([frame]);
+    expect(packets).toEqual([config, frame]);
     channel.socket.close();
   });
 

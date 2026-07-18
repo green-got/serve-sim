@@ -4,7 +4,7 @@
 //
 //   - placeholder : programmatically rendered moving frames (default)
 //   - webcam      : live AVCaptureDevice (front Mac camera, Continuity, …)
-//   - browser     : JPEG frames streamed from the remote viewer's browser
+//   - browser     : H.264 streamed from the remote viewer's browser
 //   - image       : a single PNG/JPEG, written once
 //
 // A UNIX-domain control socket lets the CLI (and the in-page Camera tool)
@@ -21,7 +21,7 @@
 // Control protocol (line-delimited JSON over AF_UNIX, one command per connection):
 //   {"action":"switch","source":"webcam","arg":"MacBook Pro Camera"}
 //   {"action":"switch","source":"browser"}
-//   {"action":"stream"} -> 4-byte big-endian length + JPEG, repeated
+//   {"action":"h264Stream"} -> 4-byte big-endian length + H.264 packet, repeated
 //   {"action":"switch","source":"placeholder"}
 //   {"action":"status"}            -> server replies one JSON line
 //   {"action":"shutdown"}
@@ -33,6 +33,7 @@
 #import <Accelerate/Accelerate.h>
 #import <ImageIO/ImageIO.h>
 #import <IOSurface/IOSurface.h>
+#import <VideoToolbox/VideoToolbox.h>
 
 #include <fcntl.h>
 #include <arpa/inet.h>
@@ -59,8 +60,10 @@ static uint32_t gHeight = SIMCAM_DEFAULT_HEIGHT;
 static const char *gShmName = NULL;
 static volatile sig_atomic_t gShouldExit = 0;
 static atomic_uint_fast64_t gFrameSeq = 0;
-static uint8_t *gBrowserFrameBuffer = NULL;
-static CGContextRef gBrowserFrameContext = NULL;
+static uint8_t *gBrowserDecodeBuffer = NULL;
+static size_t gBrowserDecodeBufferSize = 0;
+static pthread_mutex_t gBrowserDecodeLock = PTHREAD_MUTEX_INITIALIZER;
+static atomic_uint_fast64_t gBrowserDecodeErrorCount = 0;
 
 static uint64_t MachAbsToNs(uint64_t t) {
     static mach_timebase_info_data_t tb = {0,0};
@@ -411,66 +414,248 @@ static BOOL StartBrowserSource(void) {
 
 static void StopBrowserSource(void) {}
 
-#pragma mark Image source
+typedef struct {
+    VTDecompressionSessionRef session;
+    CMVideoFormatDescriptionRef format;
+} BrowserH264Decoder;
 
-static BOOL EnsureBrowserFrameRenderer(void) {
-    if (gBrowserFrameBuffer && gBrowserFrameContext) return YES;
-    size_t bytesPerRow = (size_t)gWidth * 4;
-    gBrowserFrameBuffer = calloc(1, bytesPerRow * gHeight);
-    if (!gBrowserFrameBuffer) return NO;
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    gBrowserFrameContext = CGBitmapContextCreate(
-        gBrowserFrameBuffer,
-        gWidth,
-        gHeight,
-        8,
-        bytesPerRow,
-        colorSpace,
-        kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little
-    );
-    CGColorSpaceRelease(colorSpace);
-    if (gBrowserFrameContext) return YES;
-    free(gBrowserFrameBuffer);
-    gBrowserFrameBuffer = NULL;
-    return NO;
-}
-
-static void ReleaseBrowserFrameRenderer(void) {
-    if (gBrowserFrameContext) {
-        CGContextRelease(gBrowserFrameContext);
-        gBrowserFrameContext = NULL;
+static void BrowserH264Output(
+    void *refCon,
+    void *sourceFrameRefCon,
+    OSStatus status,
+    VTDecodeInfoFlags infoFlags,
+    CVImageBufferRef imageBuffer,
+    CMTime presentationTimeStamp,
+    CMTime presentationDuration
+) {
+    (void)refCon;
+    (void)sourceFrameRefCon;
+    (void)infoFlags;
+    (void)presentationTimeStamp;
+    (void)presentationDuration;
+    if (status != noErr) {
+        uint64_t count = atomic_fetch_add(&gBrowserDecodeErrorCount, 1) + 1;
+        if (count == 1 || count % 60 == 0) {
+            fprintf(stderr, "[serve-sim-camera] H.264 output failed (%d, count=%llu)\n",
+                status, count);
+        }
+        return;
     }
-    free(gBrowserFrameBuffer);
-    gBrowserFrameBuffer = NULL;
+    if (!imageBuffer || gActiveSource != SimCamSourceBrowser || gShouldExit) return;
+    CVPixelBufferRef pixelBuffer = (CVPixelBufferRef)imageBuffer;
+    if (CVPixelBufferGetPixelFormatType(pixelBuffer) != kCVPixelFormatType_32BGRA) return;
+
+    pthread_mutex_lock(&gBrowserDecodeLock);
+    if (gShouldExit || gActiveSource != SimCamSourceBrowser) {
+        pthread_mutex_unlock(&gBrowserDecodeLock);
+        return;
+    }
+    CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+    size_t sourceWidth = CVPixelBufferGetWidth(pixelBuffer);
+    size_t sourceHeight = CVPixelBufferGetHeight(pixelBuffer);
+    size_t sourceStride = CVPixelBufferGetBytesPerRow(pixelBuffer);
+    void *sourceBytes = CVPixelBufferGetBaseAddress(pixelBuffer);
+    size_t needed = (size_t)gWidth * gHeight * 4;
+    if (gBrowserDecodeBufferSize < needed) {
+        free(gBrowserDecodeBuffer);
+        gBrowserDecodeBuffer = malloc(needed);
+        gBrowserDecodeBufferSize = gBrowserDecodeBuffer ? needed : 0;
+    }
+    if (gBrowserDecodeBuffer) {
+        vImage_Buffer source = { sourceBytes, sourceHeight, sourceWidth, sourceStride };
+        vImage_Buffer target = {
+            gBrowserDecodeBuffer,
+            gHeight,
+            gWidth,
+            (size_t)gWidth * 4,
+        };
+        if (vImageScale_ARGB8888(&source, &target, NULL, kvImageHighQualityResampling)
+            == kvImageNoError) {
+            PublishFrame(gBrowserDecodeBuffer);
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+    pthread_mutex_unlock(&gBrowserDecodeLock);
 }
 
-static BOOL PublishEncodedImage(NSData *encoded, NSString **err) {
-    if (!encoded.length) { if (err) *err = @"empty browser camera frame"; return NO; }
-    CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)encoded, NULL);
-    if (!src) { if (err) *err = @"could not decode browser camera frame"; return NO; }
-    CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
-    CFRelease(src);
-    if (!img) { if (err) *err = @"could not decode browser camera frame"; return NO; }
+static void ReleaseBrowserH264Decoder(BrowserH264Decoder *decoder) {
+    if (decoder->session) {
+        VTDecompressionSessionWaitForAsynchronousFrames(decoder->session);
+        VTDecompressionSessionInvalidate(decoder->session);
+        CFRelease(decoder->session);
+        decoder->session = NULL;
+    }
+    if (decoder->format) {
+        CFRelease(decoder->format);
+        decoder->format = NULL;
+    }
+}
 
-    if (!EnsureBrowserFrameRenderer()) {
-        CGImageRelease(img);
-        if (err) *err = @"browser camera frame allocation failed";
+static BOOL ConfigureBrowserH264Decoder(
+    BrowserH264Decoder *decoder,
+    NSData *configuration,
+    NSString **error
+) {
+    const uint8_t *bytes = configuration.bytes;
+    NSUInteger length = configuration.length;
+    if (length < 7 || bytes[0] != 1) {
+        if (error) *error = @"invalid H.264 decoder configuration";
         return NO;
     }
-    memset(gBrowserFrameBuffer, 0, (size_t)gWidth * gHeight * 4);
-    size_t iw = CGImageGetWidth(img), ih = CGImageGetHeight(img);
-    double sx = (double)gWidth / iw, sy = (double)gHeight / ih;
-    double scale = MIN(sx, sy);
-    double dw = iw * scale, dh = ih * scale;
-    CGContextDrawImage(
-        gBrowserFrameContext,
-        CGRectMake((gWidth - dw) / 2.0, (gHeight - dh) / 2.0, dw, dh),
-        img
+    size_t nalLengthSize = (bytes[4] & 0x03) + 1;
+    NSUInteger offset = 5;
+    NSUInteger sequenceCount = bytes[offset++] & 0x1f;
+    const uint8_t *parameterSets[64];
+    size_t parameterSetSizes[64];
+    size_t parameterSetCount = 0;
+    for (NSUInteger i = 0; i < sequenceCount; i++) {
+        if (offset + 2 > length || parameterSetCount >= 64) {
+            if (error) *error = @"invalid H.264 decoder configuration";
+            return NO;
+        }
+        NSUInteger size = ((NSUInteger)bytes[offset] << 8) | bytes[offset + 1];
+        offset += 2;
+        if (size == 0 || offset + size > length) {
+            if (error) *error = @"invalid H.264 decoder configuration";
+            return NO;
+        }
+        parameterSets[parameterSetCount] = bytes + offset;
+        parameterSetSizes[parameterSetCount++] = size;
+        offset += size;
+    }
+    if (offset >= length) {
+        if (error) *error = @"invalid H.264 decoder configuration";
+        return NO;
+    }
+    NSUInteger pictureCount = bytes[offset++];
+    for (NSUInteger i = 0; i < pictureCount; i++) {
+        if (offset + 2 > length || parameterSetCount >= 64) {
+            if (error) *error = @"invalid H.264 decoder configuration";
+            return NO;
+        }
+        NSUInteger size = ((NSUInteger)bytes[offset] << 8) | bytes[offset + 1];
+        offset += 2;
+        if (size == 0 || offset + size > length) {
+            if (error) *error = @"invalid H.264 decoder configuration";
+            return NO;
+        }
+        parameterSets[parameterSetCount] = bytes + offset;
+        parameterSetSizes[parameterSetCount++] = size;
+        offset += size;
+    }
+    if (sequenceCount == 0 || pictureCount == 0) {
+        if (error) *error = @"invalid H.264 decoder configuration";
+        return NO;
+    }
+
+    ReleaseBrowserH264Decoder(decoder);
+    OSStatus status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+        kCFAllocatorDefault,
+        parameterSetCount,
+        parameterSets,
+        parameterSetSizes,
+        (int)nalLengthSize,
+        &decoder->format
     );
-    CGImageRelease(img);
-    PublishFrame(gBrowserFrameBuffer);
+    if (status != noErr || !decoder->format) {
+        if (error) *error = [NSString stringWithFormat:@"H.264 format failed (%d)", status];
+        return NO;
+    }
+    NSDictionary *pixelAttributes = @{
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+    VTDecompressionOutputCallbackRecord callback = {
+        .decompressionOutputCallback = BrowserH264Output,
+        .decompressionOutputRefCon = NULL,
+    };
+    status = VTDecompressionSessionCreate(
+        kCFAllocatorDefault,
+        decoder->format,
+        NULL,
+        (__bridge CFDictionaryRef)pixelAttributes,
+        &callback,
+        &decoder->session
+    );
+    if (status != noErr || !decoder->session) {
+        if (error) *error = [NSString stringWithFormat:@"H.264 decoder failed (%d)", status];
+        ReleaseBrowserH264Decoder(decoder);
+        return NO;
+    }
+    VTSessionSetProperty(decoder->session, kVTDecompressionPropertyKey_RealTime, kCFBooleanTrue);
+    atomic_store(&gBrowserDecodeErrorCount, 0);
     return YES;
 }
+
+static BOOL DecodeBrowserH264Frame(
+    BrowserH264Decoder *decoder,
+    NSData *frame,
+    BOOL keyFrame,
+    NSString **error
+) {
+    if (!decoder->session || !decoder->format) {
+        if (error) *error = @"H.264 decoder is not configured";
+        return NO;
+    }
+    CMBlockBufferRef block = NULL;
+    OSStatus status = CMBlockBufferCreateWithMemoryBlock(
+        kCFAllocatorDefault,
+        NULL,
+        frame.length,
+        kCFAllocatorDefault,
+        NULL,
+        0,
+        frame.length,
+        0,
+        &block
+    );
+    if (status == noErr) {
+        status = CMBlockBufferReplaceDataBytes(frame.bytes, block, 0, frame.length);
+    }
+    CMSampleBufferRef sample = NULL;
+    if (status == noErr) {
+        size_t sampleSize = frame.length;
+        status = CMSampleBufferCreateReady(
+            kCFAllocatorDefault,
+            block,
+            decoder->format,
+            1,
+            0,
+            NULL,
+            1,
+            &sampleSize,
+            &sample
+        );
+    }
+    if (block) CFRelease(block);
+    if (status != noErr || !sample) {
+        if (error) *error = [NSString stringWithFormat:@"H.264 sample failed (%d)", status];
+        if (sample) CFRelease(sample);
+        return NO;
+    }
+    CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sample, YES);
+    if (attachments && CFArrayGetCount(attachments) > 0) {
+        CFMutableDictionaryRef attachment = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
+        CFDictionarySetValue(attachment, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
+        if (!keyFrame) CFDictionarySetValue(attachment, kCMSampleAttachmentKey_NotSync, kCFBooleanTrue);
+    }
+    VTDecodeInfoFlags info = 0;
+    status = VTDecompressionSessionDecodeFrame(
+        decoder->session,
+        sample,
+        kVTDecodeFrame_EnableAsynchronousDecompression,
+        NULL,
+        &info
+    );
+    CFRelease(sample);
+    if (status != noErr) {
+        if (error) *error = [NSString stringWithFormat:@"H.264 decode failed (%d)", status];
+        return NO;
+    }
+    return YES;
+}
+
+#pragma mark Image source
 
 static BOOL StartImageSource(NSString *path, NSString **err) {
     if (!path.length) { if (err) *err = @"image source needs a path"; return NO; }
@@ -740,7 +925,7 @@ static NSString *SourceName(SimCamSourceKind k) {
 static int gControlListenFd = -1;
 static dispatch_source_t gAcceptSource;
 static dispatch_queue_t gControlAcceptQueue;
-static const uint32_t kMaxBrowserFrameBytes = 1024 * 1024;
+static const uint32_t kMaxBrowserPacketBytes = 2 * 1024 * 1024;
 
 static NSData *EncodeReply(NSDictionary *dict) {
     NSMutableDictionary *m = dict.mutableCopy;
@@ -841,39 +1026,59 @@ static BOOL ReadExact(int fd, void *bytes, size_t length) {
     return YES;
 }
 
-static void HandleFrameStream(int fd) {
-    NSData *ready = EncodeReply(@{ @"ok": @YES, @"stream": @YES });
+static void HandleH264Stream(int fd) {
+    NSData *ready = EncodeReply(@{
+        @"ok": @YES,
+        @"stream": @YES,
+        @"codec": @"h264",
+    });
     if (write(fd, ready.bytes, ready.length) < 0) return;
+    BrowserH264Decoder decoder = {0};
 
     while (1) {
         uint32_t encodedLength = 0;
-        if (!ReadExact(fd, &encodedLength, sizeof(encodedLength))) return;
+        if (!ReadExact(fd, &encodedLength, sizeof(encodedLength))) break;
         uint32_t length = ntohl(encodedLength);
-        if (length == 0 || length > kMaxBrowserFrameBytes) {
+        if (length < 2 || length > kMaxBrowserPacketBytes) {
             NSData *reply = EncodeReply(@{
                 @"ok": @NO,
-                @"error": @"invalid browser camera frame",
+                @"error": @"invalid browser camera H.264 packet",
             });
             write(fd, reply.bytes, reply.length);
-            return;
+            break;
         }
 
         @autoreleasepool {
-            NSMutableData *jpeg = [NSMutableData dataWithLength:length];
-            if (!ReadExact(fd, jpeg.mutableBytes, length)) return;
+            NSMutableData *packet = [NSMutableData dataWithLength:length];
+            if (!ReadExact(fd, packet.mutableBytes, length)) break;
+            const uint8_t *bytes = packet.bytes;
             NSString *error = nil;
-            BOOL ok = gActiveSource == SimCamSourceBrowser
-                ? PublishEncodedImage(jpeg, &error)
-                : NO;
+            BOOL ok = NO;
             if (gActiveSource != SimCamSourceBrowser) {
                 error = @"camera source is not browser";
+            } else if (bytes[0] == 1) {
+                ok = ConfigureBrowserH264Decoder(
+                    &decoder,
+                    [packet subdataWithRange:NSMakeRange(1, length - 1)],
+                    &error
+                );
+            } else if (bytes[0] == 2) {
+                ok = DecodeBrowserH264Frame(
+                    &decoder,
+                    [packet subdataWithRange:NSMakeRange(2, length - 2)],
+                    bytes[1] == 1,
+                    &error
+                );
+            } else {
+                error = @"unknown browser camera H.264 packet";
             }
             NSData *reply = EncodeReply(ok
                 ? @{ @"ok": @YES }
-                : @{ @"ok": @NO, @"error": error ?: @"browser camera frame failed" });
-            if (write(fd, reply.bytes, reply.length) < 0) return;
+                : @{ @"ok": @NO, @"error": error ?: @"browser camera H.264 packet failed" });
+            if (write(fd, reply.bytes, reply.length) < 0) break;
         }
     }
+    ReleaseBrowserH264Decoder(&decoder);
 }
 
 static void *HandleClient(void *context) {
@@ -895,8 +1100,8 @@ static void *HandleClient(void *context) {
                 [buf replaceBytesInRange:NSMakeRange(0, consumed) withBytes:NULL length:0];
                 if (line.length == 0) continue;
                 NSDictionary *command = DecodeCommand(line);
-                if ([command[@"action"] isEqualToString:@"stream"]) {
-                    HandleFrameStream(fd);
+                if ([command[@"action"] isEqualToString:@"h264Stream"]) {
+                    HandleH264Stream(fd);
                     close(fd);
                     return NULL;
                 }
@@ -1109,8 +1314,12 @@ int main(int argc, const char *argv[]) {
         StopPlaceholderSource();
         StopWebcamSource();
         StopVideoSource();
-        ReleaseBrowserFrameRenderer();
+        pthread_mutex_lock(&gBrowserDecodeLock);
+        free(gBrowserDecodeBuffer);
+        gBrowserDecodeBuffer = NULL;
+        gBrowserDecodeBufferSize = 0;
         ReleaseSurfaces();
+        pthread_mutex_unlock(&gBrowserDecodeLock);
         fprintf(stderr, "[serve-sim-camera] stopped\n");
         return 0;
     }

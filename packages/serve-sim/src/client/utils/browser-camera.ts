@@ -100,14 +100,25 @@ function waitForVideo(video: HTMLVideoElement): Promise<void> {
   });
 }
 
-function canvasBlob(canvas: HTMLCanvasElement): Promise<Blob> {
-  return new Promise((resolve, reject) => {
-    canvas.toBlob(
-      (blob) => blob ? resolve(blob) : reject(new Error("Could not encode browser camera frame")),
-      "image/jpeg",
-      0.72,
-    );
-  });
+const H264_CONFIG_PACKET = 1;
+const H264_FRAME_PACKET = 2;
+
+export function browserCameraH264ConfigPacket(description: AllowSharedBufferSource): ArrayBuffer {
+  const bytes = ArrayBuffer.isView(description)
+    ? new Uint8Array(description.buffer, description.byteOffset, description.byteLength)
+    : new Uint8Array(description);
+  const packet = new Uint8Array(1 + bytes.byteLength);
+  packet[0] = H264_CONFIG_PACKET;
+  packet.set(bytes, 1);
+  return packet.buffer;
+}
+
+export function browserCameraH264FramePacket(chunk: EncodedVideoChunk): ArrayBuffer {
+  const packet = new Uint8Array(2 + chunk.byteLength);
+  packet[0] = H264_FRAME_PACKET;
+  packet[1] = chunk.type === "key" ? 1 : 0;
+  chunk.copyTo(packet.subarray(2));
+  return packet.buffer;
 }
 
 export async function startBrowserCameraFeed({
@@ -121,19 +132,26 @@ export async function startBrowserCameraFeed({
   stream: MediaStream;
   onError: (message: string) => void;
 }): Promise<BrowserCameraFeed> {
+  if (typeof VideoEncoder === "undefined" || typeof VideoFrame === "undefined") {
+    throw new Error("This browser does not support H.264 webcam streaming.");
+  }
+
   const video = document.createElement("video");
   video.muted = true;
   video.playsInline = true;
   video.style.cssText = "position:fixed;width:1px;height:1px;opacity:0;pointer-events:none";
   document.body.append(video);
   video.srcObject = stream;
+  const releaseVideo = () => {
+    video.pause();
+    video.srcObject = null;
+    video.remove();
+  };
   try {
     await video.play();
     await waitForVideo(video);
   } catch (error) {
-    video.pause();
-    video.srcObject = null;
-    video.remove();
+    releaseVideo();
     throw error;
   }
 
@@ -144,7 +162,31 @@ export async function startBrowserCameraFeed({
   canvas.width = Math.max(1, Math.round(sourceWidth * scale));
   canvas.height = Math.max(1, Math.round(sourceHeight * scale));
   const context = canvas.getContext("2d", { alpha: false });
-  if (!context) throw new Error("Browser camera canvas is unavailable");
+  if (!context) {
+    releaseVideo();
+    throw new Error("Browser camera canvas is unavailable");
+  }
+
+  const encoderConfig: VideoEncoderConfig = {
+    codec: "avc1.42E01E",
+    width: canvas.width,
+    height: canvas.height,
+    bitrate: 1_200_000,
+    framerate: 30,
+    latencyMode: "realtime",
+    avc: { format: "avc" },
+  };
+  let support: VideoEncoderSupport;
+  try {
+    support = await VideoEncoder.isConfigSupported(encoderConfig);
+  } catch (error) {
+    releaseVideo();
+    throw error;
+  }
+  if (!support.supported) {
+    releaseVideo();
+    throw new Error("This browser cannot encode the webcam as H.264.");
+  }
 
   const socket = new WebSocket(browserCameraSocketUrl(endpoint, window.location.href));
   socket.binaryType = "arraybuffer";
@@ -176,29 +218,49 @@ export async function startBrowserCameraFeed({
     });
   } catch (error) {
     socket.close();
-    video.pause();
-    video.srcObject = null;
-    video.remove();
+    releaseVideo();
     throw error;
   }
 
   let stopped = false;
-  let encoding = false;
-  const sendFrame = async () => {
-    if (stopped || encoding || socket.readyState !== WebSocket.OPEN) return;
-    if (socket.bufferedAmount > 512 * 1024 || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
-    encoding = true;
+  let frameIndex = 0;
+  let timestamp = 0;
+  const encoder = new VideoEncoder({
+    output(chunk, metadata) {
+      if (stopped || socket.readyState !== WebSocket.OPEN) return;
+      const description = metadata?.decoderConfig?.description;
+      if (description) socket.send(browserCameraH264ConfigPacket(description));
+      socket.send(browserCameraH264FramePacket(chunk));
+    },
+    error(error) {
+      if (!stopped) onError(`Browser H.264 encoder failed: ${error.message}`);
+    },
+  });
+  try {
+    encoder.configure(support.config ?? encoderConfig);
+  } catch (error) {
+    socket.close();
+    releaseVideo();
+    throw error;
+  }
+
+  const sendFrame = () => {
+    if (stopped || socket.readyState !== WebSocket.OPEN) return;
+    if (socket.bufferedAmount > 256 * 1024 || encoder.encodeQueueSize > 2
+        || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
     try {
       context.drawImage(video, 0, 0, canvas.width, canvas.height);
-      socket.send(await canvasBlob(canvas).then((blob) => blob.arrayBuffer()));
+      const frame = new VideoFrame(canvas, { timestamp });
+      encoder.encode(frame, { keyFrame: frameIndex % 60 === 0 });
+      frame.close();
+      frameIndex++;
+      timestamp += Math.round(1_000_000 / 30);
     } catch (error) {
       onError(error instanceof Error ? error.message : String(error));
-    } finally {
-      encoding = false;
     }
   };
-  const stopFrameLoop = startBrowserCameraFrameLoop(video, () => { void sendFrame(); });
-  void sendFrame();
+  const stopFrameLoop = startBrowserCameraFrameLoop(video, sendFrame);
+  sendFrame();
 
   socket.onmessage = (event) => {
     void eventText(event.data).then((text) => {
@@ -217,10 +279,9 @@ export async function startBrowserCameraFeed({
       if (stopped) return;
       stopped = true;
       stopFrameLoop();
+      encoder.close();
       socket.close();
-      video.pause();
-      video.srcObject = null;
-      video.remove();
+      releaseVideo();
     },
   };
 }

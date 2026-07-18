@@ -84,6 +84,18 @@ final class RunnerTests: XCTestCase {
         applications[bundleId] = app
         let snapshot = try app.snapshot()
         payload = ["ok": true, "tree": serialize(snapshot)]
+      case "typeText":
+        guard let bundleId = request.bundleId?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !bundleId.isEmpty else {
+          throw RunnerError.invalidBundleId
+        }
+        guard let text = request.text, !text.isEmpty else {
+          throw RunnerError.invalidText
+        }
+        let app = applications[bundleId] ?? XCUIApplication(bundleIdentifier: bundleId)
+        applications[bundleId] = app
+        app.typeText(text)
+        payload = ["ok": true]
       case "shutdown":
         payload = ["ok": true]
         lifetime?.fulfill()
@@ -162,15 +174,18 @@ final class RunnerTests: XCTestCase {
 private struct Request: Decodable {
   let command: String
   let bundleId: String?
+  let text: String?
 }
 
 private enum RunnerError: LocalizedError {
   case invalidBundleId
+  case invalidText
   case invalidCommand
 
   var errorDescription: String? {
     switch self {
-    case .invalidBundleId: return "snapshot requires bundleId"
+    case .invalidBundleId: return "command requires bundleId"
+    case .invalidText: return "typeText requires non-empty text"
     case .invalidCommand: return "unsupported runner command"
     }
   }
